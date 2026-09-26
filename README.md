@@ -14,7 +14,7 @@ A Python tool for working through Speexx exercises in Chrome. It includes manual
 
 YouTube demo: **replace the sample URL below with your published video link**
 
-[ดูวิดีโอตัวอย่างบน YouTube / Watch the YouTube demo](https://www.youtube.com/watch?v=YOUR_VIDEO_ID)
+[ดูวิดีโอตัวอย่างบน YouTube / Watch the YouTube demo](https://www.youtube.com/watch?v=kvW_HZhoD6c)
 
 ## แบบฝึกหัดที่รองรับ / Exercise Types
 
