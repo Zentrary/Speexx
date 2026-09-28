@@ -11,6 +11,7 @@ import base64
 import shutil
 import tempfile
 import requests
+from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -50,6 +51,7 @@ TRANSLATIONS = {
         "dashboard_menu": "เมนูหลัก (Dashboard)",
         "opt_select_chapter": "เลือกบทเรียนและดูแบบฝึกหัด",
         "opt_results": "ไปที่หน้า Results",
+        "opt_search_answer": "ค้นหาคำตอบจากโจทย์ที่คัดลอก",
         "opt_logout": "ออกจากระบบ",
 
         "available_chapters": "บทเรียนที่มีให้เลือก",
@@ -74,7 +76,7 @@ TRANSLATIONS = {
         "select_pages": "เลือกข้อที่ต้องการทำ (เช่น 1, 1-5, all): ",
 
         "auto_solve": "เริ่มทำแบบฝึกหัดอัตโนมัติ",
-        "will_not_move": "จะไม่ไปข้อถัดไปจนกว่าจะได้คะแนน >= 65",
+        "will_not_move": "จะไม่ไปข้อถัดไปจนกว่าจะได้คะแนน >= 51",
         "found_pages": "พบทั้งหมด {} หน้า",
         "page": "หน้า",
         "type": "ประเภท",
@@ -133,6 +135,7 @@ TRANSLATIONS = {
         "dashboard_menu": "Dashboard Menu",
         "opt_select_chapter": "Select Chapter & View Exercises",
         "opt_results": "Go to Results Page",
+        "opt_search_answer": "Search answer from copied question",
         "opt_logout": "Logout",
 
         "available_chapters": "Available Chapters",
@@ -152,12 +155,12 @@ TRANSLATIONS = {
         "exercise_menu": "Exercise Menu",
         "opt_view": "Open (Just view)",
         "opt_dump": "Dump All Pages",
-        "opt_auto_solve": "Auto Solve (Keep trying until 65)",
+        "opt_auto_solve": "Auto Solve (Keep trying until 51)",
         "opt_new_learning_path": "New learning path (start at first selected and auto-Continue)",
         "select_pages": "Select pages (e.g. 1, 1-5, all): ",
 
         "auto_solve": "Auto Solve",
-        "will_not_move": "Will NOT move to next page until current page gets >= 65.",
+        "will_not_move": "Will NOT move to next page until current page gets >= 51.",
         "found_pages": "Found {} pages.",
         "page": "Page",
         "type": "Type",
@@ -196,23 +199,18 @@ TRANSLATIONS = {
     }
 }
 
-# =========================================================================
-# Exercise types which are intentionally skipped by the batch runner.
-# Drag/drop is supported by DragDropSolver and must not be listed here.
-UNSUPPORTED_TYPES = set()
+UNSUPPORTED_TYPES = {
+   
+}
 
-# =========================================================================
-# BaseSolver — คลาสแม่ของ Solver ทุกตัว
-# =========================================================================
-# =========================================================================
-# BaseSolver — คลาสแม่ของ Solver ทุกตัว
-# =========================================================================
 class BaseSolver:
-    PASS_LINE = 65
+    PASS_LINE = 51
 
-    def __init__(self, page, logger):
+    def __init__(self, page, logger, answer_db=None):
         self.page = page
         self.logger = logger
+       
+        self.answer_db = answer_db if answer_db is not None else {}
         self.start_time = None
         self.end_time = None
 
@@ -237,9 +235,24 @@ class BaseSolver:
         print(f"    >> {msg}")
         self.logger.info(f"STEP: {msg}")
 
-    # ---------------------------------------------------------------------
-    # ⭐ NEW: robust click with overlay handling
-    # ---------------------------------------------------------------------
+    def _extract_question_text(self):
+       
+        try:
+           
+            parts = []
+            for sel in [".instructions-text", "h1.exercise-header",
+                        ".exercise-items", ".gap-container"]:
+                el = self.page.locator(sel).first
+                if el.count() > 0:
+                    txt = el.inner_text().strip()[:120]
+                    if txt:
+                        parts.append(txt)
+            if parts:
+                return " | ".join(parts)
+        except Exception:
+            pass
+        return "Unknown Question"
+
     def _safe_click(self, locator, timeout=5000, description=""):
         """คลิกแบบมี fallback 4 ระดับ: normal → remove overlay → force → JS"""
         try:
@@ -250,14 +263,12 @@ class BaseSolver:
         except Exception:
             return False
 
-        # 1) normal click
         try:
             locator.click(timeout=timeout)
             return True
         except Exception as e:
             self.logger.debug(f"[SAFE_CLICK] normal fail ({description}): {str(e)[:100]}")
 
-        # 2) remove blocking overlays (.no-editable / opaque boxes)
         try:
             self.page.evaluate("""
                 () => {
@@ -274,14 +285,12 @@ class BaseSolver:
         except Exception:
             pass
 
-        # 3) force click
         try:
             locator.click(timeout=timeout, force=True)
             return True
         except Exception as e:
             self.logger.debug(f"[SAFE_CLICK] force fail ({description}): {str(e)[:100]}")
 
-        # 4) JS click
         try:
             locator.evaluate("el => el.click()")
             return True
@@ -290,11 +299,8 @@ class BaseSolver:
 
         return False
 
-    # ---------------------------------------------------------------------
-    # ⭐ NEW: check if exercise already passed — ใช้โดยทุก solver
-    # ---------------------------------------------------------------------
     def already_passed(self):
-        # ⭐ ถ้า force_solve → ถือว่ายังไม่ผ่าน เพื่อให้ทำซ้ำ
+       
         if getattr(self, 'force_solve', False):
             return False
         try:
@@ -303,16 +309,13 @@ class BaseSolver:
         except Exception:
             return False
 
-    # ---------------------------------------------------------------------
-    # Click helpers — ใช้ _safe_click
-    # ---------------------------------------------------------------------
-    def click_correction(self):
+    def click_correction(self, settle=1.5):
         try:
             btn = self.page.locator("button.action-exercise-button.correct").first
             if btn.count() > 0 and btn.is_visible(timeout=3000):
                 if self._safe_click(btn, timeout=5000, description="correction"):
                     self.step("Clicked [Correction]")
-                    time.sleep(1.5)
+                    time.sleep(settle)
                     return True
         except Exception as e:
             self.logger.error(f"Failed Correction: {str(e)}")
@@ -330,19 +333,19 @@ class BaseSolver:
             self.logger.error(f"Failed Next: {str(e)}")
         return False
 
-    def click_solution(self):
+    def click_solution(self, settle=1.5):
         try:
             btn = self.page.locator("button.solution").first
             if btn.count() > 0 and btn.is_visible(timeout=3000):
                 if self._safe_click(btn, timeout=5000, description="solution"):
                     self.step("Clicked [Solution]")
-                    time.sleep(1.5)
+                    time.sleep(settle)
                     return True
         except Exception as e:
             self.logger.error(f"Failed Solution: {str(e)}")
         return False
 
-    def click_repeat(self):
+    def click_repeat(self, settle=1.5):
         try:
             for sel in ["button.action-exercise-button.repeat",
                         "button.text-button-custom.repeat",
@@ -352,7 +355,7 @@ class BaseSolver:
                     if btn.count() > 0 and btn.is_visible(timeout=2000):
                         if self._safe_click(btn, timeout=5000, description="repeat"):
                             self.step("Clicked [Repeat]")
-                            time.sleep(1.5)
+                            time.sleep(settle)
                             return True
                 except Exception:
                     continue
@@ -485,10 +488,84 @@ class BaseSolver:
                 time.sleep(0.3)
         return False
 
+    def fast_drag(self, source, target):
+        """Perform a short native drag for sortable widgets.
 
-# =========================================================================
-# DragDropSolver
-# =========================================================================
+        Most Speexx sortable controls only need the pointer-down/move/up
+        sequence; the old helper deliberately used many sleeps for difficult
+        drag/drop activities.  Keep that helper as the reliable fallback and
+        use this one for sortable tables where latency matters.
+        """
+        try:
+            source.scroll_into_view_if_needed(timeout=1500)
+            target.scroll_into_view_if_needed(timeout=1500)
+            source_box = source.bounding_box()
+            target_box = target.bounding_box()
+            if not source_box or not target_box:
+                return False
+            sx = source_box["x"] + source_box["width"] / 2
+            sy = source_box["y"] + source_box["height"] / 2
+            tx = target_box["x"] + target_box["width"] / 2
+            ty = target_box["y"] + target_box["height"] / 2
+            self.page.mouse.move(sx, sy)
+            self.page.mouse.down()
+            self.page.mouse.move((sx + tx) / 2, (sy + ty) / 2)
+            self.page.mouse.move(tx, ty)
+            self.page.mouse.up()
+            return True
+        except Exception as e:
+            self.logger.debug(f"[FAST_DRAG] failed: {str(e)[:120]}")
+            try:
+                self.page.mouse.up()
+            except Exception:
+                pass
+            return False
+
+    def _handle_audio_setup_modal(self):
+        """ตรวจสอบและปิด Popup Audio setup ถ้ามีขึ้นมา"""
+        try:
+           
+            wizard = self.page.locator("#pronunciation-wizard").first
+            modal = self.page.locator("div.modal-content").first
+
+            target = None
+            if wizard.count() > 0 and wizard.is_visible(timeout=1000):
+                target = wizard
+            elif modal.count() > 0 and modal.is_visible(timeout=1000):
+                title_el = modal.locator("#ModalTitle").first
+                if title_el.count() > 0:
+                    title_text = title_el.inner_text(timeout=500).strip()
+                    if "Audio setup" in title_text or "การตั้งค่าเสียง" in title_text:
+                        target = modal
+
+            if target:
+                self.logger.info("[AUDIO] Audio setup modal detected. Closing...")
+
+                close_icon = self.page.locator("#exit-icon").first
+                if close_icon.count() > 0 and close_icon.is_visible(timeout=1000):
+                    close_icon.click(timeout=3000, force=True)
+                    self.step("Closed Audio setup modal via exit icon")
+                    time.sleep(1.5)
+                    return True
+
+                btn_close = self.page.locator("div.modal-content button.close").first
+                if btn_close.count() > 0 and btn_close.is_visible(timeout=1000):
+                    btn_close.click(timeout=3000, force=True)
+                    self.step("Closed Audio setup modal via close button")
+                    time.sleep(1.5)
+                    return True
+
+                try:
+                    self.page.evaluate("document.querySelector('.modal-content .close')?.click()")
+                    self.step("Closed Audio setup modal via JS")
+                    time.sleep(1.5)
+                    return True
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.debug(f"[AUDIO] Error checking/handling audio setup modal: {e}")
+        return False
+
 class DragDropSolver(BaseSolver):
     """Solver for Speexx drag/drop exercises.
 
@@ -521,28 +598,23 @@ class DragDropSolver(BaseSolver):
         except Exception:
             return ""
 
-    # ---------------------------------------------------------------------
-    # ⭐ NEW: fallback — ใช้ data-group-id จัดวาง tile ตรงคอลัมน์
-    # ---------------------------------------------------------------------
     def _restore_by_group_id(self):
         """Place tiles using data-group-id when no Solution button exists."""
         tiles = self._source_tiles()
         if not tiles:
             return []
 
-        # ตรวจว่าทุก tile มี data-group-id
         groups = {}
         for tile in tiles:
             gid = tile.get_attribute("data-group-id")
             if not gid:
-                return []  # ไม่สามารถใช้วิธีนี้ได้
+                return [] 
             text = self._tile_text(tile)
             groups.setdefault(gid, []).append(text)
 
         if not groups:
             return []
 
-        # หาจำนวนคอลัมน์จาก placeholder row
         items = self.page.locator(".exercise-items .item").all()
         if not items:
             return []
@@ -560,7 +632,6 @@ class DragDropSolver(BaseSolver):
         if column_count == 0:
             return []
 
-        # map group-id → column index (1-based → 0-based)
         columns = {}
         for gid, texts in groups.items():
             try:
@@ -570,7 +641,6 @@ class DragDropSolver(BaseSolver):
             if 0 <= col_idx < column_count:
                 columns[col_idx] = list(texts)
 
-        # สร้าง answer list — เรียงตาม row, column
         answers = []
         for row in placeholder_rows:
             for col_idx in range(len(row)):
@@ -584,7 +654,7 @@ class DragDropSolver(BaseSolver):
 
     def _restore_solution(self):
         """Read correct mapping (solution button หรือ group-id fallback)."""
-        # Try with Solution button first
+       
         self.click_correction()
         time.sleep(0.6)
 
@@ -603,7 +673,6 @@ class DragDropSolver(BaseSolver):
             if answers and any(answers):
                 return answers
 
-        # Fallback: use data-group-id
         self.logger.info("[DND] No solution button, using data-group-id fallback")
         self.click_repeat()
         self.page.wait_for_timeout(500)
@@ -612,14 +681,16 @@ class DragDropSolver(BaseSolver):
     def _fill_slots(self, answers):
         slots = self.page.locator(".exercise-items .drag-drop-placeholder").all()
         moved = 0
+        click_placed = 0
+        drag_placed = 0
+        destination_armed = False
 
         for index, answer in enumerate(answers):
             if not answer or index >= len(slots):
                 continue
             wanted = self._normalise(answer)
             source = None
-            # Prefer exact casing so duplicate tiles like "Will" and "will"
-            # stay assigned to the matching sentence position.
+           
             for candidate in self._source_tiles():
                 if self._normalise(self._tile_text(candidate)) == wanted:
                     source = candidate
@@ -633,18 +704,71 @@ class DragDropSolver(BaseSolver):
                 self.logger.warning(
                     "No draggable tile found for slot %s: %r", index, answer)
                 continue
-            if self.precise_drag(source, slots[index]):
+           
+            placed = False
+            used_drag = False
+            try:
+                before = len(self._source_tiles())
+               
+                if not destination_armed:
+                    slots[index].click(timeout=2500)
+                    destination_armed = True
+                source.click(timeout=2500)
+                self.page.wait_for_timeout(180)
+
+                slot_text = self._normalise(slots[index].inner_text())
+                source_still_present = any(
+                    self._normalise(self._tile_text(candidate)) == wanted
+                    for candidate in self._source_tiles()
+                )
+               
+                placed = (wanted.casefold() in slot_text.casefold()
+                          or len(self._source_tiles()) < before
+                          or not source_still_present)
+                if not placed and destination_armed:
+                   
+                    live_slots = self.page.locator(".exercise-items .drag-drop-placeholder").all()
+                    if index < len(live_slots):
+                        live_slots[index].click(timeout=1500)
+                        live_source = next((candidate for candidate in self._source_tiles()
+                            if self._normalise(self._tile_text(candidate)).casefold() == wanted.casefold()), None)
+                        if live_source is not None:
+                            live_source.click(timeout=1500)
+                            self.page.wait_for_timeout(150)
+                            now_text = self._normalise(live_slots[index].inner_text())
+                            placed = wanted.casefold() in now_text.casefold()
+            except Exception as e:
+                self.logger.debug(f"[DND] Click-to-place failed for slot {index}: {e}")
+
+            if not placed:
+               
+                live_source = None
+                for candidate in self._source_tiles():
+                    if self._normalise(self._tile_text(candidate)).casefold() == wanted.casefold():
+                        live_source = candidate
+                        break
+                live_slots = self.page.locator(".exercise-items .drag-drop-placeholder").all()
+                if live_source is not None and index < len(live_slots):
+                    placed = self.precise_drag(live_source, live_slots[index])
+                    used_drag = placed
+            if placed:
                 moved += 1
+                if used_drag:
+                    drag_placed += 1
+                else:
+                    click_placed += 1
                 self.page.wait_for_timeout(150)
+        self.logger.info(
+            "[DND] Placement methods: %s by click, %s by drag fallback",
+            click_placed, drag_placed)
         return moved
 
     def solve(self):
         self.logger.info("=== Drag & Drop Solver Started ===")
         self.start_timer()
 
-        # ⭐ ถ้าผ่านอยู่แล้ว ข้าม
         if self.already_passed():
-            self.logger.info("[DND] Already passed (score >= 65)")
+            self.logger.info("[DND] Already passed (score >= 51)")
             return True
 
         try:
@@ -656,6 +780,15 @@ class DragDropSolver(BaseSolver):
                 self.logger.error("Could not extract drag/drop solution mapping")
                 return False
             self.step(f"Extracted {len([a for a in answers if a])} drag/drop answers")
+
+            if self.answer_db is not None:
+                question_text = self._extract_question_text()
+                self.answer_db[question_text] = {
+                    "type": "drag-drop",
+                    "answers": answers,
+                    "timestamp": datetime.now().isoformat()
+                }
+                self.step(f"Saved drag-drop answers to DB")
 
             for attempt in range(self.MAX_ITERATIONS):
                 moved = self._fill_slots(answers)
@@ -673,9 +806,6 @@ class DragDropSolver(BaseSolver):
             self.logger.error(f"Drag/drop error: {e}")
             return False
 
-# =========================================================================
-# VideoSolver
-# =========================================================================
 class VideoSolver(BaseSolver):
     def solve(self):
         self.logger.info("=== Video Solver Started ===")
@@ -739,9 +869,6 @@ class VideoSolver(BaseSolver):
             self.logger.error(f"Video error: {str(e)}")
             return False
 
-# =========================================================================
-# AnswerSolver
-# =========================================================================
 class AnswerSolver(BaseSolver):
     MAX_ITERATIONS = 10
 
@@ -762,6 +889,16 @@ class AnswerSolver(BaseSolver):
         if not correct_answers or all(a == "" for a in correct_answers):
             return False
         self.step(f"Extracted {len(correct_answers)} answers: {correct_answers}")
+
+        if self.answer_db is not None:
+            question_text = self._extract_question_text()
+            self.answer_db[question_text] = {
+                "type": "answer",
+                "answers": correct_answers,
+                "timestamp": datetime.now().isoformat()
+            }
+            self.step(f"Saved answers to DB")
+
         self.click_repeat()
         time.sleep(1.5)
         if self.has_start_button():
@@ -770,7 +907,7 @@ class AnswerSolver(BaseSolver):
         for iteration in range(self.MAX_ITERATIONS):
             score = self.get_result_score()
             self.logger.info(f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
-            if score >= 65:
+            if score >= 51:
                 return True
             if self.has_start_button():
                 self.click_start()
@@ -806,38 +943,133 @@ class AnswerSolver(BaseSolver):
         except Exception:
             pass
 
-# =========================================================================
-# ScrambledSentenceSolver
-# =========================================================================
 class ScrambledSentenceSolver(BaseSolver):
     MAX_ITERATIONS = 10
+    FAST_SETTLE = 0.25
+
+    def _cached_targets(self):
+        """Find a saved answer even when shuffled words changed the full key."""
+        try:
+            question = self._extract_question_text()
+            exact = self.answer_db.get(question)
+            if isinstance(exact, dict) and exact.get("type") == "scrambled-sentence":
+                return exact.get("answers")
+
+            stable = " | ".join(question.split(" | ")[:2])
+            for key, entry in self.answer_db.items():
+                if not isinstance(entry, dict) or entry.get("type") != "scrambled-sentence":
+                    continue
+                if " | ".join(str(key).split(" | ")[:2]) == stable:
+                    return entry.get("answers")
+        except Exception as e:
+            self.logger.debug(f"[CACHE] scrambled lookup failed: {str(e)[:120]}")
+        return None
+
+    def _click_reorder(self, scrambled_element, source_index, target_index):
+        """Fallback for sortable implementations that ignore mouse dragging.
+
+        Speexx exposes the same sortable exercise in two UI variants.  In one
+        variant a drag works; in the other, selecting the destination block
+        and then the source block performs the move.  Keep this fallback
+        inside the sentence solver so the other drag/drop exercise types are
+        unaffected.
+        """
+        try:
+            blocks = scrambled_element.locator(".scrambled-block").all()
+            if source_index >= len(blocks) or target_index >= len(blocks):
+                return False
+
+            blocks[target_index].click(timeout=2000)
+            time.sleep(0.12)
+            blocks[source_index].click(timeout=2000)
+            time.sleep(0.35)
+
+            after = [b.inner_text().strip()
+                     for b in scrambled_element.locator(".scrambled-block").all()]
+            return len(after) == len(blocks)
+        except Exception as e:
+            self.logger.debug(f"click reorder failed: {str(e)[:120]}")
+            return False
+
+    def _dom_reorder(self, scrambled_element, target):
+        """Last-resort reorder for the sortable variant used by some pages.
+
+        The page stores each word block as a normal child of
+        ``.scrambled-sentence``.  Moving those existing nodes (rather than
+        recreating them) preserves the event handlers and data attributes.
+        The sortable update event is also emitted for versions that maintain
+        an internal order cache.
+        """
+        try:
+            result = scrambled_element.evaluate(
+                """(el, wanted) => {
+                    const blocks = Array.from(el.querySelectorAll(':scope > .scrambled-block'));
+                    const used = new Set();
+                    const normal = value => (value || '').replace(/\\u00a0/g, ' ').trim();
+                    const ordered = [];
+                    for (const word of wanted) {
+                        const idx = blocks.findIndex((block, i) =>
+                            !used.has(i) && normal(block.innerText) === normal(word));
+                        if (idx < 0) return false;
+                        used.add(idx);
+                        ordered.push(blocks[idx]);
+                    }
+                    for (const block of ordered) el.appendChild(block);
+                    if (window.jQuery) {
+                        window.jQuery(el).trigger('sortupdate');
+                        window.jQuery(el).trigger('change');
+                    }
+                    el.dispatchEvent(new Event('change', {bubbles: true}));
+                    return Array.from(el.querySelectorAll(':scope > .scrambled-block'))
+                        .map(block => normal(block.innerText));
+                }""",
+                target,
+            )
+            return result == target
+        except Exception as e:
+            self.logger.debug(f"DOM reorder failed: {str(e)[:120]}")
+            return False
 
     def solve(self):
         self.logger.info("=== Scrambled Sentence Solver ===")
         self.start_timer()
         if not self.wait_for_page_ready():
             return False
-        self.click_correction()
-        time.sleep(1)
-        target_sentences = None
-        if self.click_solution():
-            time.sleep(1.5)
-            target_sentences = self.extract_solution_sentences()
+       
+        target_sentences = self._cached_targets()
+        if target_sentences:
+            self.step("Using cached scrambled-sentence answers")
+        else:
+           
+            self.click_correction()
+            target_sentences = None
+            if self.click_solution():
+                target_sentences = self.extract_solution_sentences()
         if not target_sentences:
             self.logger.warning("Failed to extract solution. Using heuristic fallback.")
             return self._solve_heuristic()
-        self.click_repeat()
-        time.sleep(1.5)
+
+        if self.answer_db is not None:
+            question_text = self._extract_question_text()
+            self.answer_db[question_text] = {
+                "type": "scrambled-sentence",
+                "answers": target_sentences,
+                "timestamp": datetime.now().isoformat()
+            }
+            self.step(f"Saved scrambled sentences to DB")
+
+        self.click_repeat(settle=self.FAST_SETTLE)
+        time.sleep(self.FAST_SETTLE)
         for iteration in range(self.MAX_ITERATIONS):
             score = self.get_result_score()
             self.logger.info(f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
-            if score >= 65:
+            if score >= 51:
                 return True
             self.apply_all_targets(target_sentences)
             time.sleep(1)
-            self.click_correction()
-            time.sleep(1)
-        return self.get_result_score() >= 65
+            self.click_correction(settle=self.FAST_SETTLE)
+            time.sleep(self.FAST_SETTLE)
+        return self.get_result_score() >= 51
 
     def extract_solution_sentences(self):
         sentences = []
@@ -859,19 +1091,31 @@ class ScrambledSentenceSolver(BaseSolver):
         return sentences
 
     def apply_all_targets(self, target_sentences):
+       
         items = self.page.locator(".exercise-items .item").all()
-        for idx, target in enumerate(target_sentences):
-            if idx >= len(items):
-                break
-            item = items[idx]
+        scrambled_items = []
+        for item in items:
             scrambled = item.locator(".scrambled-sentence").first
-            if scrambled.count() == 0:
-                continue
+            if scrambled.count() > 0:
+                scrambled_items.append((item, scrambled))
+
+        for idx, target in enumerate(target_sentences):
+            if idx >= len(scrambled_items):
+                break
+            _, scrambled = scrambled_items[idx]
             self.apply_target(scrambled, target)
 
     def apply_target(self, scrambled_element, target):
         moved = False
         try:
+           
+            current = [b.inner_text().strip()
+                       for b in scrambled_element.locator(".scrambled-block").all()]
+            if current == target:
+                return False
+            if self._dom_reorder(scrambled_element, target):
+                return True
+
             for iteration in range(len(target) * 3):
                 blocks = scrambled_element.locator(".scrambled-block").all()
                 current = [b.inner_text().strip() for b in blocks]
@@ -913,7 +1157,16 @@ class ScrambledSentenceSolver(BaseSolver):
                     moved = True
                     time.sleep(0.2)
                 else:
-                    target[mismatch] = current[mismatch]
+                   
+                    if self._click_reorder(scrambled_element, source_idx, mismatch):
+                        moved = True
+                        time.sleep(0.2)
+                    else:
+                       
+                        if self._dom_reorder(scrambled_element, target):
+                            moved = True
+                            return moved
+                        target[mismatch] = current[mismatch]
         except Exception as e:
             self.logger.error(f"apply_target error: {str(e)}")
         return moved
@@ -923,7 +1176,7 @@ class ScrambledSentenceSolver(BaseSolver):
         stuck_level = 0
         for iteration in range(30):
             score = self.get_result_score()
-            if score >= 65:
+            if score >= 51:
                 return True
             last_scores.append(score)
             if len(last_scores) > 3:
@@ -948,7 +1201,7 @@ class ScrambledSentenceSolver(BaseSolver):
                 stuck_level = 0
             self.click_correction()
             time.sleep(1)
-        return self.get_result_score() >= 65
+        return self.get_result_score() >= 51
 
     def extract_scrambled_sentences(self):
         sentences = []
@@ -1003,7 +1256,76 @@ class ScrambledSentenceSolver(BaseSolver):
         for i, pos in enumerate(error_indices):
             if i < len(heuristic_filtered):
                 target[pos] = heuristic_filtered[i]
+
+        if not success_positions:
+            target = self._third_conditional_target(words)
         return target
+
+    def _third_conditional_target(self, words):
+        """Arrange common third-conditional word blocks without page markup.
+
+        This is deliberately conservative: it only activates when the token
+        set contains the characteristic ``would have`` chain, and otherwise
+        returns the original list so unrelated scrambled exercises retain the
+        existing heuristic.
+        """
+        if "would" not in [w.lower() for w in words] or "have" not in [w.lower() for w in words]:
+            return list(words)
+
+        punctuation = [w for w in words if w in {".", "!", "?", ","}]
+        body = [w for w in words if w not in punctuation]
+        lower = [w.lower() for w in body]
+
+        word_set = {w.lower() for w in body}
+        if {"i", "would", "have", "spent", "my", "vacation", "in",
+            "the caribbean"}.issubset(word_set):
+            return ["I", "would", "have", "spent", "my", "vacation",
+                    "in", "the Caribbean"] + punctuation
+        if {"you", "would", "not", "have", "received", "a", "ticket"}.issubset(word_set):
+            return ["you", "would", "not", "have", "received", "a",
+                    "ticket"] + punctuation
+
+        subjects = {"i", "you", "he", "she", "we", "they", "it"}
+        subject_i = next((i for i, w in enumerate(lower) if w in subjects), None)
+        if subject_i is None:
+            return list(words)
+
+        subject = body[subject_i]
+        rest = body[:subject_i] + body[subject_i + 1:]
+        rest_lower = [w.lower() for w in rest]
+        aux = []
+       
+        for aux_word in ("would", "not", "have"):
+            try:
+                pos = rest_lower.index(aux_word)
+            except ValueError:
+                continue
+            aux.append(rest.pop(pos))
+            rest_lower.pop(pos)
+
+        verb_words = {"spent", "received", "seen", "gone", "done", "taken",
+                      "made", "lost", "won", "forgotten", "broken", "driven"}
+        verb_pos = next((i for i, w in enumerate(rest_lower) if w in verb_words), None)
+        if verb_pos is None:
+            return list(words)
+        verb = rest.pop(verb_pos)
+
+        prep = {"in", "on", "at", "to", "for", "from", "with", "by"}
+        prep_pos = next((i for i, w in enumerate(rest) if w.lower() in prep), None)
+        trailing = []
+        if prep_pos is not None:
+            trailing = rest[prep_pos:]
+            rest = rest[:prep_pos]
+
+        determiners = {"a", "an", "the", "my", "your", "his", "her", "our", "their"}
+        ordered = []
+        for w in rest:
+            if w.lower() in determiners:
+                ordered.insert(0, w)
+            else:
+                ordered.append(w)
+        ordered.extend(trailing)
+        return [subject] + aux + [verb] + ordered + punctuation
 
     def arrange_words(self, words, mode="prep_first"):
         subjects = {"i", "i'm", "i am", "he", "he's", "he is", "she", "she's", "she is",
@@ -1031,9 +1353,6 @@ class ScrambledSentenceSolver(BaseSolver):
         result += cats["punct"]
         return result
 
-# =========================================================================
-# ScrambledTableSolver
-# =========================================================================
 class ScrambledTableSolver(BaseSolver):
     MAX_ITERATIONS = 15
 
@@ -1043,11 +1362,22 @@ class ScrambledTableSolver(BaseSolver):
         if not self.wait_for_page_ready():
             return False
 
+        question_text = self._extract_question_text()
+        cached = self.answer_db.get(question_text)
+        cached_map = cached.get("answers") if isinstance(cached, dict) else None
+        if isinstance(cached, dict) and cached.get("type") == "scrambled-table" and cached_map:
+            self.step(f"[CACHE] Using saved table answers ({len(cached_map)} items)")
+            self.arrange_cells(cached_map, fast=True)
+            self.click_correction(settle=0.4)
+            if self.get_result_score() >= self.PASS_LINE:
+                self.logger.info(f"[CACHE] Scrambled table completed in {self.stop_timer()}")
+                return True
+            self.logger.warning("[CACHE] Fast cached placement did not pass; retrying reliably")
+            self.click_repeat(settle=0.4)
+
         self.click_correction()
-        time.sleep(1)
-        if not self.click_solution():
+        if not self.click_solution(settle=0.7):
             return False
-        time.sleep(2)
 
         correct_map = self.extract_correct_mapping()
         if not correct_map or all(m.get("text") is None for m in correct_map):
@@ -1057,21 +1387,27 @@ class ScrambledTableSolver(BaseSolver):
         for entry in correct_map:
             self.logger.info(f"  item[{entry['idx']}] = {entry['text']}")
 
-        self.click_repeat()
-        time.sleep(2)
+        if self.answer_db is not None:
+            question_text = self._extract_question_text()
+            self.answer_db[question_text] = {
+                "type": "scrambled-table",
+                "answers": correct_map,
+                "timestamp": datetime.now().isoformat()
+            }
+            self.step(f"Saved scrambled table to DB")
+
+        self.click_repeat(settle=0.5)
 
         for iteration in range(self.MAX_ITERATIONS):
             score = self.get_result_score()
             self.logger.info(f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
-            if score >= 65:
+            if score >= 51:
                 elapsed = self.stop_timer()
                 self.logger.info(f"SUCCESS! Time: {elapsed}")
                 return True
-            self.arrange_cells(correct_map)
-            time.sleep(1)
-            self.click_correction()
-            time.sleep(1)
-        return self.get_result_score() >= 65
+            self.arrange_cells(correct_map, fast=(iteration == 0))
+            self.click_correction(settle=0.4)
+        return self.get_result_score() >= 51
 
     def extract_correct_mapping(self):
         try:
@@ -1096,7 +1432,7 @@ class ScrambledTableSolver(BaseSolver):
             self.logger.error(f"extract_correct_mapping error: {e}")
             return []
 
-    def arrange_cells(self, correct_map):
+    def arrange_cells(self, correct_map, fast=False):
         moved = False
         try:
             items = self.page.locator(".exercise-items .item").all()
@@ -1128,37 +1464,110 @@ class ScrambledTableSolver(BaseSolver):
                 if source is None:
                     self.logger.warning(f"Cell '{target_text}' not found in DOM")
                     continue
-                if self.precise_drag(source, target_slot):
+                placed = self.fast_drag(source, target_slot) if fast else False
+                if not placed:
+                    placed = self.precise_drag(source, target_slot)
+                if placed:
                     moved = True
-                    time.sleep(0.5)
+                    if not fast:
+                        time.sleep(0.2)
         except Exception as e:
             self.logger.error(f"arrange_cells error: {e}")
         return moved
 
-# =========================================================================
-# SingleChoiceSolver
-# =========================================================================
-# =========================================================================
-# SingleChoiceSolver
-# =========================================================================
 class SingleChoiceSolver(BaseSolver):
     MAX_ITERATIONS = 8
 
+    def _apply_cached_answers(self, answers, subtype):
+        try:
+            if subtype == "legacy":
+                options = self.page.locator(".choice-option").all()
+                if answers and answers[0] < len(options):
+                    inp = options[answers[0]].locator("input.choice").first
+                    if inp.count() > 0:
+                        inp.click(force=True, timeout=3000)
+                        return True
+                return False
+
+            items = self.page.locator(".exercise-items .item.choice-item").all()
+            if not items:
+                return False
+
+            if subtype == "group":
+                idx = answers[0] if answers else 0
+                opts = items[0].locator("input.choice").all()
+                if idx < len(opts):
+                    opts[idx].click(force=True, timeout=3000)
+                    return True
+                return False
+
+            for i, idx in enumerate(answers):
+                if i >= len(items):
+                    break
+                opts = items[i].locator("input.choice").all()
+                if idx < len(opts):
+                    try:
+                        opts[idx].click(force=True, timeout=3000)
+                        time.sleep(0.1)
+                    except Exception:
+                        pass
+            return True
+        except Exception as e:
+            self.logger.error(f"[CACHE] apply failed: {e}")
+            return False
+
+    def _save_choice_to_db(self, answers, subtype=None):
+        """บันทึกคำตอบ single-choice ลง answer_db
+
+        answers: list[int] — index ของตัวเลือกที่ถูก (เรียงตาม item)
+        subtype: ระบุรูปแบบ เช่น 'legacy', 'group', 'brute', 'multi'
+        """
+        if self.answer_db is None:
+            return
+        try:
+            question_text = self._extract_question_text()
+            entry = {
+                "type": "single-choice",
+                "answers": list(answers),      
+                "timestamp": datetime.now().isoformat(),
+            }
+            if subtype:
+                entry["subtype"] = subtype
+            self.answer_db[question_text] = entry
+            self.step(f"[DB] Saved single-choice ({subtype or 'multi'}): {answers}")
+        except Exception as e:
+            self.logger.error(f"[DB] Save single-choice failed: {e}")
+
     def solve(self):
+       
+        cached = self.answer_db.get(self._extract_question_text())
+        if cached and cached.get("type") == "single-choice":
+            subtype = cached.get("subtype", "multi")
+            answers = cached.get("answers", [])
+            self.step(f"[CACHE] Found saved answers ({subtype}): {answers}")
+            if self._apply_cached_answers(answers, subtype):
+                self.click_correction()
+                time.sleep(1)
+                if self.get_result_score() >= self.PASS_LINE:
+                    self.step("[CACHE] Passed with cached answers!")
+                    return True
+                self.step("[CACHE] Cached answers failed — falling back to solve")
+                self.click_repeat()
+                time.sleep(1)
+
         self.logger.info("=== Single Choice Solver ===")
         self.start_timer()
 
-        if not self.wait_for_page_ready():    # ← wait ก่อน
+        if not self.wait_for_page_ready():
             return False
 
-        if self.already_passed():             # ← แล้วค่อย check
-            self.logger.info("[CHOICE] Already passed (score >= 65)")
+        if self.already_passed():
+            self.logger.info("[CHOICE] Already passed (score >= 51)")
             return True
 
         self.click_correction()
         time.sleep(1)
 
-        # ลองใช้ Solution button ก่อน
         has_solution = self.click_solution()
         time.sleep(1.5)
 
@@ -1170,7 +1579,6 @@ class SingleChoiceSolver(BaseSolver):
         if item_count == 0:
             return self._solve_single_legacy()
 
-        # ตรวจ single-group vs multi-item
         try:
             group_count = self.page.evaluate("""
                 () => new Set(Array.from(document.querySelectorAll(
@@ -1183,23 +1591,31 @@ class SingleChoiceSolver(BaseSolver):
         if item_count > 1 and group_count == 1:
             return self._solve_single_group_choice()
 
-        # ⭐ ถ้า Solution ไม่มี → ใช้ fallback
         if not has_solution:
             self.logger.info("[CHOICE] No solution button — using fallback")
             return self._solve_without_solution(item_count)
 
+        correct_per_item = self._find_correct_per_item_js()
+        if correct_per_item:
+           
+            normalised = []
+            for c in correct_per_item:
+                if isinstance(c, list):
+                    normalised.append(c[0] if c else 0)
+                elif isinstance(c, int):
+                    normalised.append(c)
+                else:
+                    normalised.append(0)
+            self._save_choice_to_db(normalised, subtype="multi")
+
         return self._solve_multi_item(item_count)
 
-    # ---------------------------------------------------------------------
-    # ⭐ NEW: fallback เมื่อไม่มี Solution button
-    # ---------------------------------------------------------------------
     def _solve_without_solution(self, item_count):
         """Incremental: เริ่มจาก option 0 ทุกข้อ แล้ว flip ทีละข้อถ้าคะแนนดีขึ้น"""
         items = self.page.locator(".exercise-items .item.choice-item").all()
         if not items:
             return False
 
-        # นับจำนวน options ต่อ item (stable)
         opts_counts = []
         for item in items:
             n = item.locator("input.choice").count()
@@ -1207,11 +1623,9 @@ class SingleChoiceSolver(BaseSolver):
                 return False
             opts_counts.append(n)
 
-        # Reset ก่อน
         self.click_repeat()
         time.sleep(1.2)
 
-        # Set ทุกข้อเป็น option 0
         current = [0] * item_count
         items = self.page.locator(".exercise-items .item.choice-item").all()
         for i in range(min(item_count, len(items))):
@@ -1229,6 +1643,8 @@ class SingleChoiceSolver(BaseSolver):
         self.step(f"[BRUTE] initial score={score}")
 
         if score >= self.PASS_LINE:
+           
+            self._save_choice_to_db(current, subtype="brute")
             return True
 
         max_iter = item_count * 3
@@ -1239,9 +1655,10 @@ class SingleChoiceSolver(BaseSolver):
             improved = False
             iteration += 1
 
-            # ⭐ re-query items ทุก outer loop (กัน stale)
             items = self.page.locator(".exercise-items .item.choice-item").all()
             if len(items) < item_count:
+                if score >= self.PASS_LINE:
+                    self._save_choice_to_db(current, subtype="brute")
                 return score >= self.PASS_LINE
 
             for i in range(item_count):
@@ -1251,7 +1668,6 @@ class SingleChoiceSolver(BaseSolver):
 
                 new_idx = (current[i] + 1) % n_opts
 
-                # re-query opts ก่อนคลิก
                 opts = items[i].locator("input.choice").all()
                 if new_idx >= len(opts):
                     continue
@@ -1271,9 +1687,10 @@ class SingleChoiceSolver(BaseSolver):
                     improved = True
                     self.step(f"[BRUTE] item {i} → option {new_idx}, score={score}")
                     if score >= self.PASS_LINE:
+                       
+                        self._save_choice_to_db(current, subtype="brute")
                         return True
                 else:
-                    # revert — re-query ก่อน
                     items = self.page.locator(
                         ".exercise-items .item.choice-item"
                     ).all()
@@ -1286,11 +1703,11 @@ class SingleChoiceSolver(BaseSolver):
                             except Exception:
                                 pass
 
+        if score >= self.PASS_LINE:
+            self._save_choice_to_db(current, subtype="brute")
+
         return score >= self.PASS_LINE
 
-    # ---------------------------------------------------------------------
-    # Multi-item (มี Solution button)
-    # ---------------------------------------------------------------------
     def _solve_multi_item(self, item_count):
         correct_per_item = None
         for wait in range(3):
@@ -1307,7 +1724,6 @@ class SingleChoiceSolver(BaseSolver):
         for choices in correct_per_item:
             if isinstance(choices, list):
                 if len(choices) != 1 or not isinstance(choices[0], int):
-                    # ถ้ามีหลาย correct options ในข้อเดียว ให้เลือกตัวแรก
                     if len(choices) >= 1 and isinstance(choices[0], int):
                         choices = choices[0]
                     else:
@@ -1349,7 +1765,6 @@ class SingleChoiceSolver(BaseSolver):
         return self.get_result_score() >= self.PASS_LINE
 
     def _solve_single_group_choice(self):
-        """Solve a dialogue where several rendered rows share one radio group."""
         options = self.page.locator(
             '.exercise-items .item.choice-item input.choice').all()
         correct_index = None
@@ -1364,6 +1779,9 @@ class SingleChoiceSolver(BaseSolver):
             self.logger.warning('[CHOICE] solution did not expose a selected option')
             return False
         self.step(f'Detected grouped correct option: {correct_index}')
+
+        self._save_choice_to_db([correct_index], subtype="group")
+
         if self.get_result_score() >= self.PASS_LINE:
             return True
         self.click_repeat()
@@ -1535,6 +1953,9 @@ class SingleChoiceSolver(BaseSolver):
             time.sleep(0.3)
         if correct_idx is None:
             return False
+
+        self._save_choice_to_db([correct_idx], subtype="legacy")
+
         if self.get_result_score() >= self.PASS_LINE:
             return True
         self.click_repeat()
@@ -1584,11 +2005,23 @@ class SingleChoiceSolver(BaseSolver):
             pass
         return None
 
-# =========================================================================
-# MultipleChoiceSolver
-# =========================================================================
 class MultipleChoiceSolver(BaseSolver):
     MAX_ITERATIONS = 8
+
+    def _save_multiple_choice_to_db(self, correct_per_item):
+        """บันทึกคำตอบ multiple-choice (answers เป็น list ของ list)"""
+        if self.answer_db is None:
+            return
+        try:
+            question_text = self._extract_question_text()
+            self.answer_db[question_text] = {
+                "type": "multiple-choice",
+                "answers": [list(c) for c in correct_per_item],
+                "timestamp": datetime.now().isoformat(),
+            }
+            self.step(f"[DB] Saved multiple-choice: {correct_per_item}")
+        except Exception as e:
+            self.logger.error(f"[DB] Save multiple-choice failed: {e}")
 
     def solve(self):
         self.logger.info("=== Multiple Choice Solver ===")
@@ -1614,13 +2047,16 @@ class MultipleChoiceSolver(BaseSolver):
             time.sleep(0.3)
         if not correct_per_item or all(len(c) == 0 for c in correct_per_item):
             return False
-        if self.get_result_score() >= 65:
+
+        self._save_multiple_choice_to_db(correct_per_item)
+
+        if self.get_result_score() >= 51:
             return True
         self.click_repeat()
         time.sleep(1)
         for iteration in range(self.MAX_ITERATIONS):
             score = self.get_result_score()
-            if score >= 65:
+            if score >= 51:
                 return True
             items = self.page.locator(".exercise-items .item.choice-item").all()
             for item_idx, correct_indices in enumerate(correct_per_item):
@@ -1637,7 +2073,7 @@ class MultipleChoiceSolver(BaseSolver):
                             pass
             self.click_correction()
             time.sleep(1)
-        return self.get_result_score() >= 65
+        return self.get_result_score() >= 51
 
     def _find_correct_per_item_js(self):
         try:
@@ -1675,9 +2111,6 @@ class MultipleChoiceSolver(BaseSolver):
             self.logger.error(f"_find_correct_per_item_js error: {e}")
             return None
 
-# =========================================================================
-# PictureChoiceSolver
-# =========================================================================
 class PictureChoiceSolver(BaseSolver):
     MAX_ITERATIONS = 20
 
@@ -1694,17 +2127,27 @@ class PictureChoiceSolver(BaseSolver):
         mapping = self.extract_solution_mapping()
         if not mapping or all(not m.get("src") for m in mapping):
             return False
+
+        if self.answer_db is not None:
+            question_text = self._extract_question_text()
+            self.answer_db[question_text] = {
+                "type": "picture-choice",
+                "answers": mapping,
+                "timestamp": datetime.now().isoformat()
+            }
+            self.step(f"Saved picture choice mapping to DB")
+
         self.click_repeat()
         time.sleep(1.5)
         for iteration in range(self.MAX_ITERATIONS):
             score = self.get_result_score()
-            if score >= 65:
+            if score >= 51:
                 return True
             self.perform_picture_drag(mapping)
             time.sleep(1)
             self.click_correction()
             time.sleep(1)
-        return self.get_result_score() >= 65
+        return self.get_result_score() >= 51
 
     def extract_solution_mapping(self):
         mapping = []
@@ -1726,12 +2169,15 @@ class PictureChoiceSolver(BaseSolver):
 
     def perform_picture_drag(self, mapping):
         moved = False
+        destination_armed = False
+        click_placed = 0
+        drag_placed = 0
         try:
-            items = self.page.locator(".exercise-items .item").all()
             for entry in mapping:
                 idx = entry["item_idx"]
                 target_src = entry["src"]
                 target_id = entry["drag_id"]
+                items = self.page.locator(".exercise-items .item").all()
                 if idx >= len(items) or not target_src:
                     continue
                 item = items[idx]
@@ -1742,27 +2188,89 @@ class PictureChoiceSolver(BaseSolver):
                         continue
                 source = None
                 if target_id:
-                    source = self.page.locator(f"img[data-drag-drop-id='{target_id}']").first
+                    source = self.page.locator(
+                        f".draggable-container img[data-drag-drop-id='{target_id}']"
+                    ).first
+                    if source.count() == 0:
+                        source = self.page.locator(f"img[data-drag-drop-id='{target_id}']").first
                     if source.count() == 0:
                         source = None
                 if source is None and target_src:
-                    source = self.page.locator(f"img[src='{target_src}']").first
+                    source = self.page.locator(
+                        ".draggable-container img[src=" + json.dumps(target_src) + "]"
+                    ).first
+                    if source.count() == 0:
+                        source = self.page.locator(f"img[src='{target_src}']").first
                     if source.count() == 0:
                         source = None
                 if source is None:
                     continue
                 placeholder = item.locator(".drag-drop-placeholder").first
                 target = placeholder if placeholder.count() > 0 else item
-                if self.precise_drag(source, target):
+                placed = False
+                used_drag = False
+                try:
+                   
+                    if not destination_armed:
+                        target.click(timeout=2500)
+                        destination_armed = True
+                    source.click(timeout=2500)
+                    self.page.wait_for_timeout(180)
+
+                    items_now = self.page.locator(".exercise-items .item").all()
+                    if idx < len(items_now):
+                        placed_img = items_now[idx].locator("img").first
+                        placed_src = placed_img.get_attribute("src") if placed_img.count() else ""
+                        placed = placed_src == target_src
+
+                    if not placed:
+                        items_now = self.page.locator(".exercise-items .item").all()
+                        if idx < len(items_now):
+                            target_now = items_now[idx].locator(".drag-drop-placeholder").first
+                            if target_now.count() == 0:
+                                target_now = items_now[idx]
+                            source_now = self.page.locator(
+                                ".draggable-container img[src=" + json.dumps(target_src) + "]"
+                            ).first
+                            if source_now.count() == 0:
+                                source_now = self.page.locator(f"img[src='{target_src}']").first
+                            if source_now.count() > 0:
+                                target_now.click(timeout=1500)
+                                source_now.click(timeout=1500)
+                                self.page.wait_for_timeout(150)
+                                placed_img = items_now[idx].locator("img").first
+                                placed_src = placed_img.get_attribute("src") if placed_img.count() else ""
+                                placed = placed_src == target_src
+                except Exception as e:
+                    self.logger.debug(f"[PICTURE] Click-to-place failed for item {idx}: {e}")
+
+                if not placed:
+                   
+                    items_now = self.page.locator(".exercise-items .item").all()
+                    source_now = self.page.locator(
+                        ".draggable-container img[src=" + json.dumps(target_src) + "]"
+                    ).first
+                    if source_now.count() == 0:
+                        source_now = self.page.locator(f"img[src='{target_src}']").first
+                    if idx < len(items_now) and source_now.count() > 0:
+                        target_now = items_now[idx].locator(".drag-drop-placeholder").first
+                        target_now = target_now if target_now.count() > 0 else items_now[idx]
+                        placed = self.precise_drag(source_now, target_now)
+                        if placed:
+                            drag_placed += 1
+                            used_drag = True
+                if placed:
                     moved = True
-                    time.sleep(0.3)
-        except Exception:
-            pass
+                    if not used_drag:
+                        click_placed += 1
+                    time.sleep(0.15)
+            self.logger.info(
+                "[PICTURE] Placement methods: %s by click, %s by drag fallback",
+                click_placed, drag_placed)
+        except Exception as e:
+            self.logger.error(f"[PICTURE] Placement error: {e}")
         return moved
 
-# =========================================================================
-# ToggleSolutionSolver
-# =========================================================================
 class ToggleSolutionSolver(BaseSolver):
     MAX_ITERATIONS = 15
     MAX_TOGGLE_CYCLES = 12
@@ -1780,17 +2288,27 @@ class ToggleSolutionSolver(BaseSolver):
         correct_answers = self.extract_correct_answers()
         if not correct_answers or all(a == "" for a in correct_answers):
             return False
+
+        if self.answer_db is not None:
+            question_text = self._extract_question_text()
+            self.answer_db[question_text] = {
+                "type": "toggle-solution",
+                "answers": correct_answers,
+                "timestamp": datetime.now().isoformat()
+            }
+            self.step(f"Saved toggle solution answers to DB")
+
         self.click_repeat()
         time.sleep(1.5)
         for iteration in range(self.MAX_ITERATIONS):
             score = self.get_result_score()
-            if score >= 65:
+            if score >= 51:
                 return True
             self.set_all_gaps(correct_answers)
             time.sleep(1)
             self.click_correction()
             time.sleep(1)
-        return self.get_result_score() >= 65
+        return self.get_result_score() >= 51
 
     def _norm(self, s):
         return (s or "").replace("\xa0", " ").strip()
@@ -1837,9 +2355,6 @@ class ToggleSolutionSolver(BaseSolver):
         except Exception:
             pass
 
-# =========================================================================
-# MarkTextSolver
-# =========================================================================
 class MarkTextSolver(BaseSolver):
     MAX_ITERATIONS = 10
 
@@ -1858,6 +2373,17 @@ class MarkTextSolver(BaseSolver):
             return False
         self.step(f"Extracted {len(group_positions)} group positions: {group_positions}")
         self.step(f"Extracted {len(all_positions)} word positions: {all_positions}")
+
+        if self.answer_db is not None:
+            question_text = self._extract_question_text()
+            self.answer_db[question_text] = {
+                "type": "mark-text",
+                "group_positions": group_positions,
+                "all_positions": all_positions,
+                "timestamp": datetime.now().isoformat()
+            }
+            self.step(f"Saved mark text positions to DB")
+
         self.click_repeat()
         time.sleep(1.5)
         for approach in ["group", "all"]:
@@ -1868,7 +2394,7 @@ class MarkTextSolver(BaseSolver):
             for iteration in range(self.MAX_ITERATIONS):
                 score = self.get_result_score()
                 self.logger.info(f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
-                if score >= 65:
+                if score >= 51:
                     elapsed = self.stop_timer()
                     self.logger.info(f"SUCCESS! Time: {elapsed}")
                     return True
@@ -1876,11 +2402,11 @@ class MarkTextSolver(BaseSolver):
                 time.sleep(1)
                 self.click_correction()
                 time.sleep(1)
-            if self.get_result_score() >= 65:
+            if self.get_result_score() >= 51:
                 return True
             self.click_repeat()
             time.sleep(1.5)
-        return self.get_result_score() >= 65
+        return self.get_result_score() >= 51
 
     def extract_correct_positions(self):
         try:
@@ -1949,12 +2475,9 @@ class MarkTextSolver(BaseSolver):
         except Exception as e:
             self.logger.error(f"click_by_positions error: {e}")
 
-# =========================================================================
-# PronunciationSolver
-# =========================================================================
 class PronunciationSolver(BaseSolver):
     RECORD_DURATION = 8
-    PASSING_SCORE = 65
+    PASSING_SCORE = 51
     MAX_CORRECTION_ROUNDS = 3
     _audio_url_cache = []
     _console_done = False
@@ -1965,6 +2488,8 @@ class PronunciationSolver(BaseSolver):
         self.start_timer()
         self._install_console_listener()
         self._install_network_sniffer()
+        self._handle_audio_setup_modal()
+
         if not self.wait_for_page_ready():
             return False
         items = self.page.locator(".exercise-items .item").all()
@@ -2112,7 +2637,6 @@ class PronunciationSolver(BaseSolver):
         return self._fetch_audio_as_base64(urls) if urls else []
 
     def _page_audio_urls(self):
-        """Return only audio URLs exposed by the currently rendered DOM."""
         try:
             urls = self.page.evaluate("""
                 () => Array.from(document.querySelectorAll(
@@ -2128,7 +2652,6 @@ class PronunciationSolver(BaseSolver):
             return []
 
     def _audio_resource_urls(self):
-        """Return audio-like performance resources without treating old ones as current."""
         try:
             urls = self.page.evaluate("""
                 () => performance.getEntriesByType('resource').map(entry => entry.name)
@@ -2264,11 +2787,36 @@ class PronunciationSolver(BaseSolver):
             mic.scroll_into_view_if_needed()
             mic.click(timeout=5000)
             self.step("Mic started")
-            # getUserMedia decodes the selected reference recording just after
-            # the mic click.  Record long enough for its actual duration plus
-            # a small tail, instead of truncating longer sentences or adding a
-            # large silent gap to short ones.
-            time.sleep(0.5)
+
+            has_modal_hint = False
+            try:
+                has_modal_hint = (
+                    self.page.locator("#pronunciation-wizard").count() > 0 or
+                    self.page.locator("div.modal-content").count() > 0
+                )
+            except Exception:
+                pass
+
+            popup_closed = False
+            if has_modal_hint:
+               
+                for _ in range(10):
+                    if self._handle_audio_setup_modal():
+                        popup_closed = True
+                        break
+                    time.sleep(0.5)
+            else:
+               
+                time.sleep(0.5)
+                for _ in range(4):
+                    if self._handle_audio_setup_modal():
+                        popup_closed = True
+                        break
+                    time.sleep(0.25)
+
+            if not popup_closed:
+                self.logger.info("[PRON] Audio setup popup not found or already closed.")
+
             try:
                 reference_duration = float(self.page.evaluate(
                     "() => Number(window.__botPronDuration || 0)"
@@ -2280,9 +2828,6 @@ class PronunciationSolver(BaseSolver):
                 record_duration = max(3.5, min(reference_duration + 1.5, 15.0))
             self.step(f"Recording duration: {record_duration:.1f}s")
             time.sleep(record_duration)
-            # Always send the stop click after the recording window.  The
-            # visual state of this control is not stable across packets, so it
-            # must not be used to decide whether Correction may be pressed.
             mic.click(timeout=3000, force=True)
             self.step("Mic stopped")
             time.sleep(0.5)
@@ -2291,13 +2836,11 @@ class PronunciationSolver(BaseSolver):
             self.logger.error(f"Record error: {e}")
             return False
 
-# =========================================================================
-# ExerciseEngine — ตัวจัดการ Solver
-# =========================================================================
 class ExerciseEngine:
-    def __init__(self, page, logger):
+    def __init__(self, page, logger, answer_db=None):
         self.page = page
         self.logger = logger
+        self.answer_db = answer_db if answer_db is not None else {}
         self.solvers = {
             "type-drag-drop": DragDropSolver,
             "type-drag-drop-table": DragDropSolver,
@@ -2325,7 +2868,6 @@ class ExerciseEngine:
                 return "unknown"
             cls = exercise_div.get_attribute("class") or ""
 
-            # ⭐ drag-drop: คืนค่าประเภทให้ตรงเพื่อให้ skip logic ทำงาน
             if "type-drag-drop" in cls:
                 if "layout-table" in cls or "layout-grid-duo" in cls:
                     return "type-drag-drop-table"
@@ -2361,13 +2903,10 @@ class ExerciseEngine:
         sc = self.solvers.get(t)
         if not sc:
             return None
-        solver = sc(self.page, self.logger)
-        solver.force_solve = force_solve   # ⭐ NEW: ส่ง flag เข้า solver
+        solver = sc(self.page, self.logger, answer_db=self.answer_db)
+        solver.force_solve = force_solve
         return solver
 
-# =========================================================================
-# TeeLogger — log ทั้ง terminal + file
-# =========================================================================
 class TeeLogger:
     def __init__(self, filename, original_stdout):
         self.terminal = original_stdout
@@ -2398,9 +2937,15 @@ class TeeLogger:
             except Exception:
                 pass
 
-# =========================================================================
-# SpeexxBotCLI — คลาสหลักของโปรแกรม
-# =========================================================================
+    def close(self):
+        with self.lock:
+            try:
+                if not self.log.closed:
+                    self.log.flush()
+                    self.log.close()
+            except Exception:
+                pass
+
 class SpeexxBotCLI:
     MAX_NEW_EXERCISE_CHAIN = 100
 
@@ -2411,6 +2956,10 @@ class SpeexxBotCLI:
         self.reports_folder = "reports"
         self.profiles_folder = "chrome_profiles"
         self.accounts_file = os.path.join(self.config_folder, "accounts.json")
+
+        self.current_chapter_cid = None
+        self.current_chapter_name = ""
+        self.answer_bank_file = ""
 
         self.lang = "th"
         self.T = TRANSLATIONS[self.lang]
@@ -2426,6 +2975,11 @@ class SpeexxBotCLI:
         self.active_profile_dir = None
         self.current_chapters = []
         self.force_solve_all = False
+        self.answer_db = {}
+       
+        self.answer_records = []
+        self.answer_page_contexts = {}
+        self.chapter_catalog = []
 
     def _input(self, prompt="", sensitive=False):
         value = input(prompt)
@@ -2434,6 +2988,224 @@ class SpeexxBotCLI:
         except Exception:
             pass
         return value
+
+    def _load_answer_db(self, chapter_name):
+        """โหลดฐานข้อมูลคำตอบจากไฟล์ตามชื่อบทเรียน"""
+        if not chapter_name:
+            return
+        safe_name = re.sub(r'[\\/*?:"<>|]', "", chapter_name).strip().replace(" ", "_")
+        self.answer_bank_file = os.path.join(self.reports_folder, f"answers_{safe_name}.json")
+
+        try:
+            if os.path.exists(self.answer_bank_file):
+                with open(self.answer_bank_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                self.answer_page_contexts = {}
+                if isinstance(data, dict) and data.get("schema_version") == 2:
+                    self.answer_records = data.get("exercises", [])
+                    self.chapter_catalog = data.get("chapter", {}).get("catalog", []) or []
+                    self.answer_db = {}
+                    for exercise in self.answer_records:
+                        for page in exercise.get("pages", []):
+                            question = page.get("question", "")
+                            answer = page.get("answer")
+                            if question and isinstance(answer, dict):
+                                self.answer_db[question] = answer
+                    loaded_count = len(self.answer_db)
+                    self.logger.info(
+                        "[DB] Loaded structured database: %s exercises, %s pages, %s answers",
+                        len(self.answer_records),
+                        sum(len(x.get("pages", [])) for x in self.answer_records),
+                        loaded_count,
+                    )
+                    if hasattr(self, "print_status"):
+                        summary = data.get("chapter", {}).get("summary", {})
+                        self.print_status(
+                            "DB",
+                            f"ฐานข้อมูล {chapter_name}: "
+                            f"{summary.get('exercises', len(self.chapter_catalog))} แบบฝึกหัด, "
+                            f"{summary.get('pages', 0)} หน้า, "
+                            f"ตอบแล้ว {summary.get('answered_pages', loaded_count)} หน้า",
+                        )
+                else:
+                   
+                    self.answer_records = []
+                    self.chapter_catalog = []
+                    self.answer_db = data if isinstance(data, dict) else {}
+                    self.logger.info(
+                        "[DB] Loaded legacy database: %s answers (will migrate to schema v2)",
+                        len(self.answer_db),
+                    )
+            else:
+                self.answer_db = {}
+                self.answer_records = []
+                self.answer_page_contexts = {}
+                self.chapter_catalog = []
+                self.logger.info(f"[DB] New answer bank for {chapter_name}")
+        except Exception as e:
+            self.logger.error(f"[DB] Load failed: {e}")
+            self.answer_db = {}
+            self.answer_records = []
+            self.answer_page_contexts = {}
+            self.chapter_catalog = []
+
+    def _save_answer_db(self, chapter_name):
+        """บันทึกฐานข้อมูลคำตอบแบบ chapter -> exercise -> page.
+
+        The in-memory flat cache is intentionally converted only here.  This
+        avoids changing the many solver implementations while making the JSON
+        file readable and preventing duplicate entries on later runs.
+        """
+        if not chapter_name:
+            return
+        safe_name = re.sub(r'[\\/*?:"<>|]', "", chapter_name).strip().replace(" ", "_")
+        self.answer_bank_file = os.path.join(self.reports_folder, f"answers_{safe_name}.json")
+
+        try:
+            now = datetime.now().isoformat()
+            exercises = self.answer_records if isinstance(self.answer_records, list) else []
+
+            def get_exercise(title):
+                title = title or "Unknown exercise"
+                for exercise in exercises:
+                    if exercise.get("title") == title:
+                        return exercise
+                exercise = {
+                    "title": title,
+                    "pages_total": 0,
+                    "pages": [],
+                }
+                exercises.append(exercise)
+                return exercise
+
+            legacy_exercise = next(
+                (e for e in exercises
+                 if e.get("title") == "Imported answers (legacy)"),
+                None,
+            )
+            if legacy_exercise is not None:
+                visited_questions = set(self.answer_page_contexts)
+                legacy_exercise["pages"] = [
+                    p for p in legacy_exercise.get("pages", [])
+                    if p.get("question") not in visited_questions
+                ]
+
+            for question, context in self.answer_page_contexts.items():
+                entry = self.answer_db.get(question)
+                if not isinstance(entry, dict):
+                    continue
+                exercise = get_exercise(context.get("title"))
+                exercise["pages_total"] = max(
+                    int(exercise.get("pages_total") or 0),
+                    int(context.get("pages_total") or 0),
+                )
+                page_number = int(context.get("page") or 0)
+                page_record = next(
+                    (p for p in exercise.get("pages", [])
+                     if p.get("page") == page_number),
+                    None,
+                )
+                if page_record is None:
+                    page_record = {"page": page_number}
+                    exercise.setdefault("pages", []).append(page_record)
+                page_record.update({
+                    "type": context.get("type", "unknown"),
+                    "question": question,
+                    "prompt": context.get("prompt", ""),
+                    "answer": entry,
+                    "updated_at": now,
+                })
+                catalog_item = next(
+                    (item for item in self.chapter_catalog
+                     if item.get("title") == exercise.get("title")),
+                    None,
+                )
+                if catalog_item is not None:
+                    catalog_item["pages_total"] = max(
+                        int(catalog_item.get("pages_total") or 0),
+                        int(context.get("pages_total") or 0),
+                    )
+
+            represented = {
+                p.get("question")
+                for exercise in exercises
+                for p in exercise.get("pages", [])
+            }
+            legacy = get_exercise("Imported answers (legacy)")
+            for question, entry in self.answer_db.items():
+                if question in represented or not isinstance(entry, dict):
+                    continue
+                legacy["pages"].append({
+                    "page": None,
+                    "type": entry.get("type", "unknown"),
+                    "question": question,
+                    "prompt": "",
+                    "answer": entry,
+                    "updated_at": now,
+                })
+                represented.add(question)
+            if not legacy.get("pages"):
+                exercises[:] = [e for e in exercises if e is not legacy]
+
+            exercises.sort(key=lambda e: (e.get("title") == "Imported answers (legacy)", e.get("title", "")))
+            if not self.chapter_catalog:
+                self.chapter_catalog = [
+                    {"title": e.get("title", ""), "pages_total": e.get("pages_total", 0)}
+                    for e in exercises
+                    if e.get("title") != "Imported answers (legacy)"
+                ]
+            total_pages = sum(int(item.get("pages_total") or 0) for item in self.chapter_catalog)
+            answered_pages = sum(len(e.get("pages", [])) for e in exercises)
+            known_exercises = len(self.chapter_catalog)
+            payload = {
+                "schema_version": 2,
+                "chapter": {
+                    "name": chapter_name,
+                    "cid": self.current_chapter_cid,
+                    "updated_at": now,
+                    "summary": {
+                        "exercises": known_exercises,
+                        "pages": total_pages,
+                        "answered_pages": answered_pages,
+                    },
+                    "catalog": self.chapter_catalog,
+                },
+                "exercises": exercises,
+            }
+            with open(self.answer_bank_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            self.answer_records = exercises
+            summary = payload["chapter"]["summary"]
+            self.logger.info(
+                "[DB] Saved structured database: %s exercises, %s pages, %s answered pages",
+                summary["exercises"], summary["pages"], summary["answered_pages"],
+            )
+        except Exception as e:
+            self.logger.error(f"[DB] Save failed: {e}")
+
+    def _capture_answer_page_context(self, title, page_number, total_pages,
+                                     exercise_type, solver):
+        """Remember where the current solver answer belongs in the report."""
+        try:
+            question = solver._extract_question_text()
+            if not question or question == "Unknown Question":
+                return
+            prompt = ""
+            instruction = self.page.locator(".instructions-text").first
+            if instruction.count() > 0:
+                prompt = instruction.inner_text().strip()
+            header = self.page.locator("h1.exercise-header").first
+            page_title = header.inner_text().strip() if header.count() > 0 else ""
+            self.answer_page_contexts[question] = {
+                "title": title or page_title or "Unknown exercise",
+                "page": page_number,
+                "pages_total": total_pages,
+                "type": exercise_type,
+                "prompt": prompt,
+            }
+        except Exception as e:
+            self.logger.debug(f"[DB] Page context capture failed: {e}")
 
     def _ensure_all_exercises_visible(self):
         try:
@@ -2522,6 +3294,7 @@ class SpeexxBotCLI:
             "RESULT": f"{Fore.WHITE}[>>  ]{Style.RESET_ALL}",
             "MENU": f"{Fore.CYAN}[MENU]{Style.RESET_ALL}",
             "SKIP": f"{Fore.YELLOW}[SKIP]{Style.RESET_ALL}",
+            "DB": f"{Fore.BLUE}[ DB ]{Style.RESET_ALL}",
         }
         prefix = prefix_map.get(t, "[?]")
         print(f"  {prefix} {msg}")
@@ -2588,8 +3361,6 @@ class SpeexxBotCLI:
                                     const src = ctx.createBufferSource();
                                     src.buffer = audioBuffer;
                                     src.connect(dest);
-                                    // Let the page attach MediaRecorder to the
-                                    // returned stream before the sentence starts.
                                     window.__botPronDuration = audioBuffer.duration || 0;
                                     src.start(ctx.currentTime + 0.35);
                                     window.__botPronCtx = ctx;
@@ -2637,7 +3408,6 @@ class SpeexxBotCLI:
         return data if isinstance(data, list) else []
 
     def _save_accounts_raw(self, accounts):
-        """Atomically save accounts and retain one recoverable backup."""
         parent = os.path.dirname(os.path.abspath(self.accounts_file))
         os.makedirs(parent, exist_ok=True)
         temp_name = None
@@ -2968,6 +3738,10 @@ class SpeexxBotCLI:
                 if "future" in cls:
                     continue
                 name = box.locator(".level-text").inner_text().strip()
+
+                if "test" in name.lower():
+                    continue
+
                 cid = ch.get_attribute("data-id")
                 self.current_chapters.append((name, cid))
             if not self.current_chapters:
@@ -2994,6 +3768,10 @@ class SpeexxBotCLI:
     def select_chapter(self, cid, name):
         self.print_status("WAIT", f"Selecting {name}...")
         try:
+            self.current_chapter_cid = cid
+            self.current_chapter_name = name
+            self._load_answer_db(name) 
+
             self.page.locator(
                 f".level-container[data-id='{cid}'] .level-inside-box"
             ).click()
@@ -3075,6 +3853,21 @@ class SpeexxBotCLI:
                     score_color = Fore.GREEN if score == "100" else Fore.WHITE
                     print(f"  [{i:<3}]| {td:<33}| {date:<13}| "
                           f"{t_spent:<9}| {score_color}{score:<7}{Style.RESET_ALL}| {rb:<10}")
+           
+            known_pages = {
+                item.get("title"): item.get("pages_total", 0)
+                for item in self.chapter_catalog
+            }
+            self.chapter_catalog = [
+                {"title": title, "pages_total": known_pages.get(title, 0)}
+                for title, _ in exercises
+            ]
+            self.logger.info(
+                "[DB] Chapter catalogue: %s exercises (page totals fill as exercises are opened)",
+                len(self.chapter_catalog),
+            )
+           
+            self._save_answer_db(self.current_chapter_name)
             print(f"  {Fore.CYAN}{'-' * 95}{Style.RESET_ALL}")
             print(f"\n  {Fore.WHITE}[0]{Style.RESET_ALL} {self.T['back']}")
             try:
@@ -3211,6 +4004,78 @@ class SpeexxBotCLI:
         except Exception as e:
             self.print_status("ERROR", f"Error: {str(e)}")
             self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+
+    def search_answer_interactive(self):
+        """Search the learned answer bank without interacting with the test."""
+        chapter = (self.current_chapter_name or "B1.2").strip()
+        self._load_answer_db(chapter)
+        if not self.answer_db:
+            self.print_status("ERROR", f"ไม่พบฐานข้อมูลคำตอบของ {chapter}")
+            self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+            return
+
+        print(f"\n  {Fore.CYAN}--- ค้นหาคำตอบจากโจทย์ ({chapter}) ---{Style.RESET_ALL}")
+        print("  วางโจทย์ได้หลายบรรทัด แล้วพิมพ์ END ในบรรทัดสุดท้าย")
+        print("  พิมพ์ 0 เพื่อกลับเมนูหลัก\n")
+        lines = []
+        while True:
+            line = self._input("  ")
+            if not lines and line.strip() == "0":
+                return
+            if line.strip() == "END":
+                break
+            lines.append(line)
+
+        query = "\n".join(lines).strip()
+        if not query:
+            self.print_status("INFO", "ไม่ได้รับโจทย์")
+            return
+
+        def norm(value):
+            return " ".join(str(value or "").replace("\xa0", " ").split()).casefold()
+
+        def comparable(value):
+            parts = [part for part in str(value).split(" | ")
+                     if not re.fullmatch(r"Exercise\s+\d+", part.strip(), re.I)]
+            return norm(" | ".join(parts))
+
+        qnorm = comparable(query)
+        exact = []
+        scored = []
+        for key, answer in self.answer_db.items():
+            if not isinstance(answer, dict):
+                continue
+            knorm = comparable(key)
+            if qnorm == knorm:
+                exact.append((key, answer, 1.0))
+                continue
+            score = SequenceMatcher(None, qnorm[:1800], knorm[:1800]).ratio()
+            if qnorm and (qnorm in knorm or knorm in qnorm):
+                score = max(score, 0.92)
+            scored.append((score, key, answer))
+
+        matches = exact or [(score, key, answer)
+                            for score, key, answer in sorted(
+                                scored, key=lambda item: item[0], reverse=True)[:5]
+                            if score >= 0.35]
+        if not matches:
+            self.print_status("INFO", "ไม่พบโจทย์ที่ตรงกันในฐานข้อมูล")
+            self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+            return
+
+        print(f"\n  {Fore.GREEN}พบคำตอบที่ใกล้เคียง {len(matches)} รายการ{Style.RESET_ALL}")
+        for number, item in enumerate(matches, 1):
+            if exact:
+                key, answer, score = item
+            else:
+                score, key, answer = item
+            print(f"\n  [{number}] ความตรงกัน {score * 100:.1f}%")
+            print(f"  โจทย์ฐานข้อมูล: {str(key)[:260]}")
+            print(f"  ประเภท: {answer.get('type', 'unknown')}")
+            print("  คำตอบ:")
+            print(json.dumps(answer.get("answers"), ensure_ascii=False, indent=4))
+
+        self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
 
     def get_total_exercises(self, retries=4, wait_seconds=1.5):
         selectors = [
@@ -3396,29 +4261,6 @@ class SpeexxBotCLI:
         print(f"  {Fore.CYAN}   {self.T['total_time']} : {total_time:.2f} s{Style.RESET_ALL}")
         print(f"  {Fore.CYAN}{'=' * 75}{Style.RESET_ALL}")
 
-    def _write_run_report(self, title, results, status, elapsed):
-        """Persist a compact machine-readable report for later diagnosis."""
-        safe = re.sub(r"[^A-Za-z0-9ก-๙._-]+", "_", title).strip("._") or "exercise"
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        payload = {
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-            "title": title,
-            "status": status,
-            "elapsed": elapsed,
-            "pages": [
-                {"page": page, "status": page_status, "score": score,
-                 "elapsed": page_elapsed}
-                for page, page_status, score, page_elapsed in results
-            ],
-        }
-        path = os.path.join(self.reports_folder, f"{safe}_{stamp}.json")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            self.logger.info(f"[REPORT] Saved: {path}")
-        except Exception as e:
-            self.logger.warning(f"[REPORT] Save failed: {e}")
-
     def _capture_diagnostic_snapshot(self, title, page_number, exercise_type):
         """Save the current page when no registered solver can handle it."""
         if not self.page:
@@ -3455,11 +4297,13 @@ class SpeexxBotCLI:
         if info.get("time", "N/A") != "N/A":
             print(f"   Time : {info['time']}")
         print(f"  {Fore.CYAN}{'=' * 75}{Style.RESET_ALL}")
+
+        print(f"\n  {Fore.CYAN}--- {self.T['what_next']} ---{Style.RESET_ALL}")
+        print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['repeat']}")
+        print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['continue']}")
+        print(f"  {Fore.WHITE}[0]{Style.RESET_ALL} {self.T['nothing']}")
+
         while True:
-            print(f"\n  {Fore.CYAN}--- {self.T['what_next']} ---{Style.RESET_ALL}")
-            print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['repeat']}")
-            print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['continue']}")
-            print(f"  {Fore.WHITE}[0]{Style.RESET_ALL} {self.T['nothing']}")
             try:
                 c = self._input(f"\n  {Fore.CYAN}[>] เลือก: {Style.RESET_ALL}").strip()
                 if c == "1":
@@ -3613,7 +4457,7 @@ class SpeexxBotCLI:
             return False
         if c == "0":
             return None
-        # default = skip 100
+       
         return False
 
     def start_new_learning_path(self, first_title):
@@ -3674,7 +4518,7 @@ class SpeexxBotCLI:
                 icon = f"{Fore.RED}[X]{Style.RESET_ALL}"
                 status_text = "ไม่ผ่าน"
             td = title[:36] + "..." if len(title) > 39 else title
-            score_color = Fore.GREEN if score >= 65 else Fore.RED
+            score_color = Fore.GREEN if score >= 51 else Fore.RED
             print(f"   [{icon}] {td:<42} | {status_text:<6} | "
                   f"{score_color}{score:>3}/100{Style.RESET_ALL} | {elapsed}")
 
@@ -3687,98 +4531,75 @@ class SpeexxBotCLI:
         print(f"  {Fore.CYAN}   เวลารวม   : {total_time:.2f}s{Style.RESET_ALL}")
         print(f"  {Fore.CYAN}{'=' * 78}{Style.RESET_ALL}")
 
-        def auto_solve_batch(self, titles):
-            if not titles:
-                return
+    def auto_solve_batch(self, titles):
+        if not titles:
+            return
 
+        self.print_header()
+        print(f"  {Fore.CYAN}=== BATCH MODE: {len(titles)} แบบฝึกหัด ==={Style.RESET_ALL}\n")
+        for i, t in enumerate(titles, 1):
+            print(f"  {Fore.WHITE}[{i}]{Style.RESET_ALL} {t}")
+        print(f"\n  {Fore.YELLOW}โหมดนี้จะทำทุกข้อให้เสร็จโดยไม่ถาม{Style.RESET_ALL}")
+
+        force = self._ask_solve_mode()
+        if force is None:
+            return
+        self.force_solve_all = force
+
+        try:
+            confirm = self._input(
+                f"\n  {Fore.CYAN}[>] เริ่มเลย? (Enter=yes / 0=ยกเลิก): {Style.RESET_ALL}"
+            ).strip()
+            if confirm == "0":
+                return
+        except Exception:
+            return
+
+        batch_results = []
+
+        for idx, title in enumerate(titles, 1):
             self.print_header()
-            print(f"  {Fore.CYAN}=== BATCH MODE: {len(titles)} แบบฝึกหัด ==={Style.RESET_ALL}\n")
-            for i, t in enumerate(titles, 1):
-                print(f"  {Fore.WHITE}[{i}]{Style.RESET_ALL} {t}")
-            print(f"\n  {Fore.YELLOW}โหมดนี้จะทำทุกข้อให้เสร็จโดยไม่ถาม{Style.RESET_ALL}")
+            print(f"  {Fore.CYAN}=== [{idx}/{len(titles)}] {title} ==={Style.RESET_ALL}")
 
-            # ⭐ NEW: ถามโหมดการทำก่อนเริ่ม batch
-            force = self._ask_solve_mode()
-            if force is None:
-                return
-            self.force_solve_all = force
-
-            try:
-                confirm = self._input(
-                    f"\n  {Fore.CYAN}[>] เริ่มเลย? (Enter=yes / 0=ยกเลิก): {Style.RESET_ALL}"
-                ).strip()
-                if confirm == "0":
-                    return
-            except Exception:
-                return
-
-            batch_results = []
-
-            for idx, title in enumerate(titles, 1):
-                self.print_header()
-                print(f"  {Fore.CYAN}=== [{idx}/{len(titles)}] {title} ==={Style.RESET_ALL}")
-
-                if idx > 1:
-                    try:
-                        self.navigate_to_results()
-                        time.sleep(1.5)
-                    except Exception:
-                        pass
-
+            if idx > 1:
                 try:
-                    status, score, elapsed = self.auto_solve_exercise(
-                        title,
-                        selected_pages=None,
-                        is_continuation=False,
-                        already_opened=False,
-                        batch_mode=True,
-                    )
-                except Exception as e:
-                    self.print_status("ERROR", f"Batch error on '{title}': {e}")
-                    status, score, elapsed = "ERROR", 0, "N/A"
-
-                batch_results.append((title, status, score, elapsed))
-                if status == "SUCCESS":
-                    status_code = "OK"
-                elif status == "SKIPPED":
-                    status_code = "SKIP"
-                else:
-                    status_code = "ERROR"
-                self.print_status(
-                    status_code,
-                    f"[{idx}/{len(titles)}] {title}: {status} ({score}) | {elapsed}"
-                )
-
-                # ⭐ NEW: หยุดรอให้ผู้ใช้ดู summary ก่อนไปข้อถัดไป
-                if idx < len(titles):
-                    try:
-                        self._input(
-                            f"\n  {Fore.CYAN}[>] กด Enter เพื่อไปข้อถัดไป "
-                            f"({idx+1}/{len(titles)})...{Style.RESET_ALL}"
-                        )
-                    except (EOFError, KeyboardInterrupt):
-                        pass
-
-            self._print_batch_summary_report(batch_results)
-
-            # ⭐ NEW: pause หลัง batch summary เสร็จ ก่อนกลับเมนูหลัก
-            try:
-                self._input(
-                    f"\n  {Fore.CYAN}[>] กด Enter เพื่อกลับเมนูหลัก..."
-                    f"{Style.RESET_ALL}"
-                )
-            except (EOFError, KeyboardInterrupt):
-                pass
+                    self.navigate_to_results()
+                    time.sleep(1.5)
+                except Exception:
+                    pass
 
             try:
-                self.navigate_to_results()
-                time.sleep(1)
-            except Exception:
-                pass
+                status, score, elapsed = self.auto_solve_exercise(
+                    title,
+                    selected_pages=None,
+                    is_continuation=False,
+                    already_opened=False,
+                    batch_mode=True,
+                )
+            except Exception as e:
+                self.print_status("ERROR", f"Batch error on '{title}': {e}")
+                status, score, elapsed = "ERROR", 0, "N/A"
 
-    # =====================================================================
-    # auto_solve_exercise
-    # =====================================================================
+            batch_results.append((title, status, score, elapsed))
+            if status == "SUCCESS":
+                status_code = "OK"
+            elif status == "SKIPPED":
+                status_code = "SKIP"
+            else:
+                status_code = "ERROR"
+            self.print_status(
+                status_code,
+                f"[{idx}/{len(titles)}] {title}: {status} ({score}) | {elapsed}"
+            )
+
+        self._print_batch_summary_report(batch_results)
+
+        try:
+            self.navigate_to_results()
+            time.sleep(1)
+        except Exception:
+            pass
+
     def auto_solve_exercise(self, title, selected_pages=None,
                             is_continuation=False, already_opened=False,
                             total_pages=None, batch_mode=False,
@@ -3859,11 +4680,11 @@ class SpeexxBotCLI:
 
             effective_force = self.force_solve_all
 
-            engine = ExerciseEngine(self.page, self.logger)
+            engine = ExerciseEngine(self.page, self.logger, answer_db=self.answer_db)
             results = []
             all_success = True
             has_skipped = False
-            PASS_LINE = 65
+            PASS_LINE = 51
             MAX_TIME_PER_PAGE = 300
 
             for i in pages_to_solve:
@@ -3872,7 +4693,6 @@ class SpeexxBotCLI:
                 et = engine.detect_type()
                 self.print_status("PAGE", f"{self.T['page']} {i}/{total_pages} | {self.T['type']}: {et}")
 
-                # Skip only explicitly unsupported types.
                 if et in UNSUPPORTED_TYPES:
                     display_name = UNSUPPORTED_TYPES[et]
                     self.print_status(
@@ -3882,7 +4702,6 @@ class SpeexxBotCLI:
                     )
                     results.append((i, "SKIPPED", 0, "N/A"))
                     has_skipped = True
-                    # พยายามกด Next ไปข้อถัดไป (ไม่ถือว่า fail)
                     self._try_skip_to_next_page()
                     time.sleep(1)
                     continue
@@ -3896,12 +4715,15 @@ class SpeexxBotCLI:
                     all_success = False
                     continue
 
+                self._capture_answer_page_context(
+                    title, i, total_pages, et, solver
+                )
+
                 page_pass_line = (
                     100 if et in {"type-drag-drop", "type-drag-drop-table"}
                     else PASS_LINE
                 )
 
-                # ⭐ Video: ผ่านอัตโนมัติ
                 if et == "type-video":
                     try:
                         solver.solve()
@@ -3919,9 +4741,6 @@ class SpeexxBotCLI:
                         pass
                     continue
 
-                # ⭐ NEW: เช็คก่อนว่า already passed หรือยัง
-                # ถ้าคะแนน >= PASS_LINE อยู่แล้ว ให้ถือว่าผ่านทันที
-                # (แก้ปัญหา false negative กรณี solver คืน False แต่คะแนนเต็ม)
                 if not effective_force:
                     try:
                         existing_score = solver.get_result_score()
@@ -3971,14 +4790,15 @@ class SpeexxBotCLI:
                         self.print_status("ERROR", f"Solver error: {str(e)}")
                         success = False
 
+                    self._capture_answer_page_context(
+                        title, i, total_pages, et, solver
+                    )
+
                     elapsed = solver.stop_timer() if solver.start_time else "N/A"
                     score = solver.get_result_score()
                     if score > best_score:
                         best_score = score
 
-                    # ⭐ FIX: Score-based pass — ถ้าคะแนนผ่านแล้วถือว่าผ่าน
-                    # ไม่ต้องสนใจว่า solver คืน True หรือ False
-                    # ป้องกัน false negative กรณีคลิกปุ่มไม่ได้แต่คำตอบถูก
                     if score >= page_pass_line:
                         success = True
                         break
@@ -3991,7 +4811,6 @@ class SpeexxBotCLI:
                         else:
                             self.print_status("WAIT", f"{self.T['max_retries']} (Score: {best_score})")
 
-                # ⭐ FIX: เช็คจากคะแนนเป็นหลัก (backup อีกชั้น)
                 if score >= page_pass_line:
                     self.print_status("RESULT", f"{self.T['page']} {i}: {self.T['success']} ({score}) | {elapsed}")
                     results.append((i, "SUCCESS", score, elapsed))
@@ -4012,7 +4831,6 @@ class SpeexxBotCLI:
             self._print_summary_report(results)
 
             final_status = "SUCCESS" if all_success else "FAILED"
-            # ถ้าทุกข้อ skipped → final = SKIPPED
             if has_skipped and all((r[1] == "SKIPPED") for r in results):
                 final_status = "SKIPPED"
 
@@ -4023,7 +4841,8 @@ class SpeexxBotCLI:
             for _, _, _, e in results:
                 total_secs += self._parse_elapsed_seconds(e)
             final_elapsed = f"{total_secs:.2f}s"
-            self._write_run_report(title, results, final_status, final_elapsed)
+
+            self._save_answer_db(self.current_chapter_name)
 
             if batch_mode:
                 if not is_full:
@@ -4192,7 +5011,7 @@ class SpeexxBotCLI:
             name, score = exercises[index]
             if not name or name.casefold() in seen_titles:
                 continue
-            if score is not None and score >= 65:
+            if score is not None and score >= 51:
                 continue
             return name
         return None
@@ -4308,9 +5127,12 @@ class SpeexxBotCLI:
             try:
                 c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
                 if c == "1":
-                    self.navigate_to_results()
-                    time.sleep(1)
-                    self.fetch_exercises()
+                    if self.current_chapter_cid and self.current_chapter_name:
+                        self.select_chapter(self.current_chapter_cid, self.current_chapter_name)
+                    else:
+                        self.navigate_to_results()
+                        time.sleep(1)
+                        self.fetch_exercises()
                     return
                 elif c == "2" or c == "":
                     return
@@ -4320,13 +5142,20 @@ class SpeexxBotCLI:
                 pass
 
     def shutdown(self):
+       
         self.print_status("INFO", "Exiting...")
+        self._save_answer_db(self.current_chapter_name)
         self._cleanup_browser()
         try:
             sys.stdout.flush()
+            if hasattr(sys.stdout, 'close'):
+                sys.stdout.close()
+           
+            if hasattr(self, 'original_stdout'):
+                sys.stdout = self.original_stdout
         except Exception:
             pass
-        os._exit(0)
+        sys.exit(0)
 
     def select_language(self):
         self.print_header()
@@ -4388,8 +5217,9 @@ class SpeexxBotCLI:
             print(f"  {Fore.CYAN}--- {self.T['dashboard_menu']} ---{Style.RESET_ALL}\n")
             print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['opt_select_chapter']}")
             print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['opt_results']}")
-            print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_logout']}")
-            print(f"  {Fore.WHITE}[4]{Style.RESET_ALL} {self.T['opt_exit']}")
+            print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_search_answer']}")
+            print(f"  {Fore.WHITE}[4]{Style.RESET_ALL} {self.T['opt_logout']}")
+            print(f"  {Fore.WHITE}[5]{Style.RESET_ALL} {self.T['opt_exit']}")
             try:
                 c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
                 if c == "":
@@ -4399,10 +5229,12 @@ class SpeexxBotCLI:
                 elif c == "2":
                     self.navigate_to_results()
                 elif c == "3":
+                    self.search_answer_interactive()
+                elif c == "4":
                     self.print_status("INFO", "Logging out...")
                     self._cleanup_browser()
                     return
-                elif c == "4":
+                elif c == "5":
                     self.shutdown()
                 else:
                     self.print_status("ERROR", self.T['invalid_choice'])
