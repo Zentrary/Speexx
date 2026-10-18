@@ -11,6 +11,8 @@ import base64
 import shutil
 import tempfile
 import requests
+import argparse
+import subprocess
 from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +43,7 @@ TRANSLATIONS = {
         "login_menu": "เมนูเข้าสู่ระบบ",
         "opt_login": "เริ่มต้นเบราว์เซอร์และเข้าสู่ระบบ",
         "opt_manage_acc": "จัดการบัญชี",
+        "opt_multi_acc": "โหมดหลายบัญชี (Multi-Account)",
         "opt_exit": "ออกจากโปรแกรม",
 
         "select_account": "เลือกบัญชี",
@@ -125,6 +128,7 @@ TRANSLATIONS = {
         "login_menu": "Login Menu",
         "opt_login": "Start Browser & Login",
         "opt_manage_acc": "Manage Accounts",
+        "opt_multi_acc": "Multi-Account Mode",
         "opt_exit": "Exit Program",
 
         "select_account": "Select Account",
@@ -286,9 +290,7 @@ class BaseSolver:
         return None
 
     def _extract_question_text(self):
-       
         try:
-           
             parts = []
             for sel in [".instructions-text", "h1.exercise-header",
                         ".exercise-items", ".gap-container"]:
@@ -301,10 +303,18 @@ class BaseSolver:
                 return " | ".join(parts)
         except Exception:
             pass
+        
+        try:
+            url = self.page.url
+            if url:
+                clean_url = url.split('?')[0]
+                return f"URL_Fallback_{clean_url}"
+        except Exception:
+            pass
+
         return "Unknown Question"
 
     def _safe_click(self, locator, timeout=5000, description=""):
-        """คลิกแบบมี fallback 4 ระดับ: normal → remove overlay → force → JS"""
         try:
             if locator.count() == 0:
                 return False
@@ -350,7 +360,6 @@ class BaseSolver:
         return False
 
     def already_passed(self):
-       
         if getattr(self, 'force_solve', False):
             return False
         try:
@@ -433,7 +442,6 @@ class BaseSolver:
             return False
 
     def get_result_score(self):
-        """พยายามดึงคะแนนจากหลายๆ จุดใน DOM"""
         try:
             self.page.wait_for_timeout(800)
 
@@ -539,13 +547,6 @@ class BaseSolver:
         return False
 
     def fast_drag(self, source, target):
-        """Perform a short native drag for sortable widgets.
-
-        Most Speexx sortable controls only need the pointer-down/move/up
-        sequence; the old helper deliberately used many sleeps for difficult
-        drag/drop activities.  Keep that helper as the reliable fallback and
-        use this one for sortable tables where latency matters.
-        """
         try:
             source.scroll_into_view_if_needed(timeout=1500)
             target.scroll_into_view_if_needed(timeout=1500)
@@ -572,59 +573,19 @@ class BaseSolver:
             return False
 
     def _handle_audio_setup_modal(self):
-        """ตรวจสอบและปิด Popup Audio setup ถ้ามีขึ้นมา"""
         try:
-           
-            wizard = self.page.locator("#pronunciation-wizard").first
-            modal = self.page.locator("div.modal-content").first
-
-            target = None
-            if wizard.count() > 0 and wizard.is_visible(timeout=1000):
-                target = wizard
-            elif modal.count() > 0 and modal.is_visible(timeout=1000):
-                title_el = modal.locator("#ModalTitle").first
-                if title_el.count() > 0:
-                    title_text = title_el.inner_text(timeout=500).strip()
-                    if "Audio setup" in title_text or "การตั้งค่าเสียง" in title_text:
-                        target = modal
-
-            if target:
-                self.logger.info("[AUDIO] Audio setup modal detected. Closing...")
-
-                close_icon = self.page.locator("#exit-icon").first
-                if close_icon.count() > 0 and close_icon.is_visible(timeout=1000):
-                    close_icon.click(timeout=3000, force=True)
-                    self.step("Closed Audio setup modal via exit icon")
-                    time.sleep(1.5)
-                    return True
-
-                btn_close = self.page.locator("div.modal-content button.close").first
-                if btn_close.count() > 0 and btn_close.is_visible(timeout=1000):
-                    btn_close.click(timeout=3000, force=True)
-                    self.step("Closed Audio setup modal via close button")
-                    time.sleep(1.5)
-                    return True
-
-                try:
-                    self.page.evaluate("document.querySelector('.modal-content .close')?.click()")
-                    self.step("Closed Audio setup modal via JS")
-                    time.sleep(1.5)
-                    return True
-                except Exception:
-                    pass
+            close_btn = self.page.locator("button.close[data-dismiss='modal'], #exit-icon, div.modal-content button.close").first
+            if close_btn.count() > 0 and close_btn.is_visible(timeout=500):
+                self.logger.info("[AUDIO] Audio setup popup detected. Closing immediately...")
+                self._safe_click(close_btn, timeout=3000, description="audio setup close")
+                self.step("Closed Audio setup popup")
+                time.sleep(0.5)
+                return True
         except Exception as e:
             self.logger.debug(f"[AUDIO] Error checking/handling audio setup modal: {e}")
         return False
 
 class DragDropSolver(BaseSolver):
-    """Solver for Speexx drag/drop exercises.
-
-    รองรับ 2 รูปแบบ:
-    1. มีปุ่ม Solution → อ่าน correct mapping จาก slots
-    2. ไม่มีปุ่ม Solution แต่ tile มี `data-group-id` → ใช้ group-id
-       จัดเรียง tile เข้าคอลัมน์ที่ถูกต้องโดยตรง
-    """
-
     MAX_ITERATIONS = 3
     EMPTY_TILE = "__SPEEXX_EMPTY_DRAG_TILE__"
 
@@ -634,7 +595,6 @@ class DragDropSolver(BaseSolver):
 
     @classmethod
     def _answer_text(cls, text):
-        """Convert a draggable's visible text into a comparable answer."""
         return cls.EMPTY_TILE if not cls._normalise(text) else cls._normalise(text)
 
     @classmethod
@@ -659,7 +619,6 @@ class DragDropSolver(BaseSolver):
             return ""
 
     def _restore_by_group_id(self):
-        """Place tiles using data-group-id when no Solution button exists."""
         tiles = self._source_tiles()
         if not tiles:
             return []
@@ -713,8 +672,6 @@ class DragDropSolver(BaseSolver):
         return answers
 
     def _restore_solution(self):
-        """Read correct mapping (solution button หรือ group-id fallback)."""
-       
         self.click_correction()
         time.sleep(0.6)
 
@@ -1012,7 +969,6 @@ class ScrambledSentenceSolver(BaseSolver):
     FAST_SETTLE = FAST_ACTION_SETTLE_SECONDS
 
     def _cached_targets(self):
-        """Find a saved answer even when shuffled words changed the full key."""
         try:
             question = self._extract_question_text()
             exact = self.answer_db.get(question)
@@ -1030,14 +986,6 @@ class ScrambledSentenceSolver(BaseSolver):
         return None
 
     def _click_reorder(self, scrambled_element, source_index, target_index):
-        """Fallback for sortable implementations that ignore mouse dragging.
-
-        Speexx exposes the same sortable exercise in two UI variants.  In one
-        variant a drag works; in the other, selecting the destination block
-        and then the source block performs the move.  Keep this fallback
-        inside the sentence solver so the other drag/drop exercise types are
-        unaffected.
-        """
         try:
             blocks = scrambled_element.locator(".scrambled-block").all()
             if source_index >= len(blocks) or target_index >= len(blocks):
@@ -1056,14 +1004,6 @@ class ScrambledSentenceSolver(BaseSolver):
             return False
 
     def _dom_reorder(self, scrambled_element, target):
-        """Last-resort reorder for the sortable variant used by some pages.
-
-        The page stores each word block as a normal child of
-        ``.scrambled-sentence``.  Moving those existing nodes (rather than
-        recreating them) preserves the event handlers and data attributes.
-        The sortable update event is also emitted for versions that maintain
-        an internal order cache.
-        """
         try:
             result = scrambled_element.evaluate(
                 """(el, wanted) => {
@@ -1104,7 +1044,6 @@ class ScrambledSentenceSolver(BaseSolver):
         if target_sentences:
             self.step("Using cached scrambled-sentence answers")
         else:
-           
             self.click_correction()
             target_sentences = None
             if self.click_solution():
@@ -1155,7 +1094,6 @@ class ScrambledSentenceSolver(BaseSolver):
         return sentences
 
     def apply_all_targets(self, target_sentences):
-       
         items = self.page.locator(".exercise-items .item").all()
         scrambled_items = []
         for item in items:
@@ -1172,7 +1110,6 @@ class ScrambledSentenceSolver(BaseSolver):
     def apply_target(self, scrambled_element, target):
         moved = False
         try:
-           
             current = [b.inner_text().strip()
                        for b in scrambled_element.locator(".scrambled-block").all()]
             if current == target:
@@ -1221,12 +1158,10 @@ class ScrambledSentenceSolver(BaseSolver):
                     moved = True
                     time.sleep(0.2)
                 else:
-                   
                     if self._click_reorder(scrambled_element, source_idx, mismatch):
                         moved = True
                         time.sleep(0.2)
                     else:
-                       
                         if self._dom_reorder(scrambled_element, target):
                             moved = True
                             return moved
@@ -1326,13 +1261,6 @@ class ScrambledSentenceSolver(BaseSolver):
         return target
 
     def _third_conditional_target(self, words):
-        """Arrange common third-conditional word blocks without page markup.
-
-        This is deliberately conservative: it only activates when the token
-        set contains the characteristic ``would have`` chain, and otherwise
-        returns the original list so unrelated scrambled exercises retain the
-        existing heuristic.
-        """
         if "would" not in [w.lower() for w in words] or "have" not in [w.lower() for w in words]:
             return list(words)
 
@@ -1581,11 +1509,6 @@ class SingleChoiceSolver(BaseSolver):
             return False
 
     def _save_choice_to_db(self, answers, subtype=None):
-        """บันทึกคำตอบ single-choice ลง answer_db
-
-        answers: list[int] — index ของตัวเลือกที่ถูก (เรียงตาม item)
-        subtype: ระบุรูปแบบ เช่น 'legacy', 'group', 'brute', 'multi'
-        """
         if self.answer_db is None:
             return
         try:
@@ -1603,7 +1526,6 @@ class SingleChoiceSolver(BaseSolver):
             self.logger.error(f"[DB] Save single-choice failed: {e}")
 
     def solve(self):
-       
         cached = self._find_cached_answer()
         if cached and cached.get("type") == "single-choice":
             subtype = cached.get("subtype", "multi")
@@ -1661,7 +1583,6 @@ class SingleChoiceSolver(BaseSolver):
 
         correct_per_item = self._find_correct_per_item_js()
         if correct_per_item:
-           
             normalised = []
             for c in correct_per_item:
                 if isinstance(c, list):
@@ -1675,7 +1596,6 @@ class SingleChoiceSolver(BaseSolver):
         return self._solve_multi_item(item_count)
 
     def _solve_without_solution(self, item_count):
-        """Incremental: เริ่มจาก option 0 ทุกข้อ แล้ว flip ทีละข้อถ้าคะแนนดีขึ้น"""
         items = self.page.locator(".exercise-items .item.choice-item").all()
         if not items:
             return False
@@ -1707,7 +1627,6 @@ class SingleChoiceSolver(BaseSolver):
         self.step(f"[BRUTE] initial score={score}")
 
         if score >= self.PASS_LINE:
-           
             self._save_choice_to_db(current, subtype="brute")
             return True
 
@@ -1751,7 +1670,6 @@ class SingleChoiceSolver(BaseSolver):
                     improved = True
                     self.step(f"[BRUTE] item {i} → option {new_idx}, score={score}")
                     if score >= self.PASS_LINE:
-                       
                         self._save_choice_to_db(current, subtype="brute")
                         return True
                 else:
@@ -2073,7 +1991,6 @@ class MultipleChoiceSolver(BaseSolver):
     MAX_ITERATIONS = 8
 
     def _save_multiple_choice_to_db(self, correct_per_item):
-        """บันทึกคำตอบ multiple-choice (answers เป็น list ของ list)"""
         if self.answer_db is None:
             return
         try:
@@ -2182,12 +2099,6 @@ class MultipleChoiceSolver(BaseSolver):
         return self.get_result_score() >= 51
 
     def _solve_without_solution(self):
-        """Greedy fallback for multiple-choice items whose solution button is hidden.
-
-        We try each checkbox in turn, keep it only when the score improves, and
-        stop once the score no longer rises. This is sufficient for the fixed
-        choice lists used by Speexx practice pages when no solution is exposed.
-        """
         try:
             items = self.page.locator(".exercise-items .item.choice-item").all()
             if not items:
@@ -2372,7 +2283,6 @@ class PictureChoiceSolver(BaseSolver):
                 placed = False
                 used_drag = False
                 try:
-                   
                     if not destination_armed:
                         target.click(timeout=2500)
                         destination_armed = True
@@ -2407,7 +2317,6 @@ class PictureChoiceSolver(BaseSolver):
                     self.logger.debug(f"[PICTURE] Click-to-place failed for item {idx}: {e}")
 
                 if not placed:
-                   
                     items_now = self.page.locator(".exercise-items .item").all()
                     source_now = self.page.locator(
                         ".draggable-container img[src=" + json.dumps(target_src) + "]"
@@ -2650,10 +2559,17 @@ class PronunciationSolver(BaseSolver):
         self.start_timer()
         self._install_console_listener()
         self._install_network_sniffer()
+        
         self._handle_audio_setup_modal()
 
         if not self.wait_for_page_ready():
             return False
+            
+        for _ in range(5):
+            if self._handle_audio_setup_modal():
+                break
+            time.sleep(0.5)
+
         items = self.page.locator(".exercise-items .item").all()
         for idx, item in enumerate(items):
             self._record_item(item, idx)
@@ -2924,6 +2840,8 @@ class PronunciationSolver(BaseSolver):
     def _record_item(self, item, idx):
         try:
             self.step(f"Recording item {idx + 1}...")
+            self._handle_audio_setup_modal()
+            
             b64_list = self._load_item_reference_audio(item)
             if not b64_list:
                 self.logger.warning(f"[PRON] No reference audio found for item {idx + 1}")
@@ -2946,30 +2864,15 @@ class PronunciationSolver(BaseSolver):
             if mic.count() == 0:
                 self.step("No mic button")
                 return
+            
+            self._handle_audio_setup_modal()
             mic.scroll_into_view_if_needed()
             mic.click(timeout=5000)
             self.step("Mic started")
 
-            has_modal_hint = False
-            try:
-                has_modal_hint = (
-                    self.page.locator("#pronunciation-wizard").count() > 0 or
-                    self.page.locator("div.modal-content").count() > 0
-                )
-            except Exception:
-                pass
-
-            popup_closed = False
-            if has_modal_hint:
-               
-                for _ in range(10):
-                    if self._handle_audio_setup_modal():
-                        popup_closed = True
-                        break
-                    time.sleep(0.5)
-            else:
-               
-                time.sleep(0.5)
+            popup_closed = self._handle_audio_setup_modal()
+            
+            if not popup_closed:
                 for _ in range(4):
                     if self._handle_audio_setup_modal():
                         popup_closed = True
@@ -3155,7 +3058,6 @@ class SpeexxBotCLI:
         return value
 
     def _load_answer_db(self, chapter_name):
-        """โหลดฐานข้อมูลคำตอบจากไฟล์ตามชื่อบทเรียน"""
         if not chapter_name:
             return
         safe_name = re.sub(r'[\\/*?:"<>|]', "", chapter_name).strip().replace(" ", "_")
@@ -3194,7 +3096,6 @@ class SpeexxBotCLI:
                             f"ตอบแล้ว {summary.get('answered_pages', loaded_count)} หน้า",
                         )
                 else:
-                   
                     self.answer_records = []
                     self.chapter_catalog = []
                     self.answer_db = data if isinstance(data, dict) else {}
@@ -3216,12 +3117,6 @@ class SpeexxBotCLI:
             self.chapter_catalog = []
 
     def _save_answer_db(self, chapter_name):
-        """บันทึกฐานข้อมูลคำตอบแบบ chapter -> exercise -> page.
-
-        The in-memory flat cache is intentionally converted only here.  This
-        avoids changing the many solver implementations while making the JSON
-        file readable and preventing duplicate entries on later runs.
-        """
         if not chapter_name:
             return
         safe_name = re.sub(r'[\\/*?:"<>|]', "", chapter_name).strip().replace(" ", "_")
@@ -3351,7 +3246,6 @@ class SpeexxBotCLI:
 
     def _capture_answer_page_context(self, title, page_number, total_pages,
                                      exercise_type, solver):
-        """Remember where the current solver answer belongs in the report."""
         try:
             question = solver._extract_question_text()
             if not question or question == "Unknown Question":
@@ -3843,32 +3737,104 @@ class SpeexxBotCLI:
             self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
             return False
 
+    def check_course_progress(self):
+        try:
+            if "/results" in self.page.url.lower():
+                info_title = self.page.locator(".progress-info .info-title").first
+                if info_title.count() > 0:
+                    text = info_title.inner_text().strip()
+                    if "100%" in text:
+                        return True
+            
+            self.page.goto("https://portal.speexx.com/", wait_until="domcontentloaded", timeout=20000)
+            time.sleep(1.5)
+            progress_btn = self.page.locator("h6:has-text('ความก้าวหน้า')").first
+            if progress_btn.count() == 0:
+                progress_btn = self.page.locator("div.flex-col:has-text('ความก้าวหน้า')").first
+            if progress_btn.count() == 0:
+                progress_btn = self.page.locator("a:has-text('Progress')").first
+            
+            if progress_btn.count() > 0:
+                progress_btn.click(timeout=10000)
+                time.sleep(1.5)
+
+            info_title = self.page.locator(".progress-info .info-title").first
+            if info_title.count() > 0:
+                text = info_title.inner_text().strip()
+                if "100%" in text:
+                    return True
+            return False
+        except Exception as e:
+            self.logger.error(f"[PROGRESS] Error checking status: {e}")
+            return False
+
     def navigate_to_results(self):
         if not self.page:
             self.print_status("ERROR", "Browser not started.")
             self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
             return False
-        self.print_status("INFO", "Navigating to Results...")
+        self.print_status("INFO", "Navigating to Dashboard -> Progress -> Exercises...")
         try:
-            self.page.goto(
-                "https://portal.speexx.com/articles/10960433/results",
-                wait_until="domcontentloaded"
-            )
-            self.page.locator(".level-container").first.wait_for(
-                state="visible", timeout=15000
-            )
+            self.page.goto("https://portal.speexx.com/", wait_until="domcontentloaded", timeout=20000)
+            time.sleep(1.5)
+            
+            progress_btn = self.page.locator("h6:has-text('ความก้าวหน้า')").first
+            if progress_btn.count() == 0:
+                progress_btn = self.page.locator("div.flex-col:has-text('ความก้าวหน้า')").first
+            if progress_btn.count() == 0:
+                progress_btn = self.page.locator("a:has-text('Progress')").first
+            
+            if progress_btn.count() > 0:
+                progress_btn.click(timeout=10000)
+                time.sleep(2)
+            else:
+                self.logger.warning("[NAV] Progress button not found, falling back to direct URL")
+                raise Exception("Progress button not found")
+
+            self.page.locator(".level-container").first.wait_for(state="visible", timeout=15000)
+            
+            if self.current_chapter_cid:
+                chapter_box = self.page.locator(f".level-container[data-id='{self.current_chapter_cid}'] .level-inside-box")
+                if chapter_box.count() > 0:
+                    chapter_box.click(timeout=10000)
+                    time.sleep(1)
+            
+            tab = self.page.locator("#results-table-exercises")
+            if tab.count() > 0:
+                tab.scroll_into_view_if_needed()
+                time.sleep(0.5)
+                tab.click()
+                time.sleep(1)
+
             try:
-                self.page.locator("tbody tr.clickable").first.wait_for(
-                    state="attached", timeout=8000
-                )
+                self.page.locator("tbody tr.clickable").first.wait_for(state="attached", timeout=8000)
             except Exception:
                 self.logger.debug("[NAV] Exercise table not ready yet")
-            self.print_status("OK", "Results loaded.")
+                
+            self.print_status("OK", "Results loaded via Dashboard.")
             return True
         except Exception as e:
-            self.print_status("ERROR", f"Failed: {str(e)}")
-            self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
-            return False
+            self.print_status("WAIT", f"Dashboard navigation failed: {str(e)}. Using direct URL.")
+            try:
+                self.page.goto(
+                    "https://portal.speexx.com/articles/10960433/results",
+                    wait_until="domcontentloaded"
+                )
+                self.page.locator(".level-container").first.wait_for(
+                    state="visible", timeout=15000
+                )
+                try:
+                    self.page.locator("tbody tr.clickable").first.wait_for(
+                        state="attached", timeout=8000
+                    )
+                except Exception:
+                    self.logger.debug("[NAV] Exercise table not ready yet")
+                self.print_status("OK", "Results loaded via fallback.")
+                return True
+            except Exception as e2:
+                self.print_status("ERROR", f"Failed to navigate: {str(e2)}")
+                self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+                return False
 
     def fetch_and_select_chapter(self):
         if not self.page:
@@ -3878,19 +3844,9 @@ class SpeexxBotCLI:
         try:
             current_url = self.page.url.lower()
             if "/results" not in current_url:
-                self.print_status("INFO", "Navigating to Results page...")
-                try:
-                    self.page.goto(
-                        "https://portal.speexx.com/articles/10960433/results",
-                        wait_until="domcontentloaded",
-                        timeout=15000
-                    )
-                except Exception as nav_e:
-                    if "interrupted by another navigation" in str(nav_e):
-                        self.logger.info("[NAV] Interrupted by Speexx redirect - OK")
-                    else:
-                        raise
-                time.sleep(2)
+                self.print_status("INFO", "Navigating to Progress page...")
+                if not self.navigate_to_results():
+                    return
 
             self.page.locator(".level-container").first.wait_for(
                 state="visible", timeout=30000
@@ -3904,7 +3860,7 @@ class SpeexxBotCLI:
                     continue
                 name = box.locator(".level-text").inner_text().strip()
 
-                if "test" in name.lower():
+                if "test" in name.lower() or "แบบทดสอบ" in name.lower():
                     continue
 
                 cid = ch.get_attribute("data-id")
@@ -4177,7 +4133,6 @@ class SpeexxBotCLI:
             self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
 
     def search_answer_interactive(self):
-        """Search the learned answer bank without interacting with the test."""
         chapter = (self.current_chapter_name or "B1.2").strip()
         self._load_answer_db(chapter)
         if not self.answer_db:
@@ -4384,7 +4339,6 @@ class SpeexxBotCLI:
             return False
 
     def _print_summary_report(self, results):
-        """⭐ แสดงสรุป — รองรับ SKIPPED"""
         total_time = 0.0
         success_count = 0
         fail_count = 0
@@ -4433,7 +4387,6 @@ class SpeexxBotCLI:
         print(f"  {Fore.CYAN}{'=' * 75}{Style.RESET_ALL}")
 
     def _capture_diagnostic_snapshot(self, title, page_number, exercise_type):
-        """Save the current page when no registered solver can handle it."""
         if not self.page:
             return None
         safe = re.sub(r"[^A-Za-z0-9ก-๙._-]+", "_", title).strip("._") or "exercise"
@@ -4610,7 +4563,6 @@ class SpeexxBotCLI:
         return False
 
     def _ask_solve_mode(self):
-        """ถามโหมดการทำ — คืน True (force), False (skip 100), None (ยกเลิก)"""
         print(f"\n  {Fore.CYAN}--- เลือกโหมดการทำ ---{Style.RESET_ALL}")
         print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} ทำทุกข้อ "
               f"(force — ทำแม้ได้ 100 แล้ว)")
@@ -4628,7 +4580,6 @@ class SpeexxBotCLI:
             return False
         if c == "0":
             return None
-       
         return False
 
     def start_new_learning_path(self, first_title):
@@ -4656,7 +4607,6 @@ class SpeexxBotCLI:
         )
 
     def _print_batch_summary_report(self, batch_results):
-        """⭐ แสดงสรุป batch — รองรับ SKIPPED"""
         total_time = 0.0
         success_count = 0
         fail_count = 0
@@ -4776,11 +4726,6 @@ class SpeexxBotCLI:
                             total_pages=None, batch_mode=False,
                             auto_continue=False, continuation_depth=0,
                             chain_seen_titles=None):
-        """
-        แก้แบบฝึกหัด (auto-solve)
-
-        Supported exercise types are dispatched through ExerciseEngine.
-        """
         if not is_continuation and not batch_mode:
             self.print_status("INFO", f"{self.T['auto_solve']}: {title}")
             self.print_status("INFO", self.T['will_not_move'])
@@ -5118,6 +5063,11 @@ class SpeexxBotCLI:
                                     "Continue แล้วหน้า/ชื่อแบบฝึกหัดไม่เปลี่ยน จึงหยุดเพื่อป้องกันวนซ้ำ"
                                 )
                                 return (final_status, final_score, final_elapsed)
+                                
+                            if auto_continue and new_title.casefold() in chain_seen_titles:
+                                self.print_status("OK", "ตรวจพบว่าแบบฝึกหัดเริ่มวนซ้ำ (หรือครบ 100% แล้ว) — หยุดการทำอัตโนมัติ")
+                                return (final_status, final_score, final_elapsed)
+                                
                             self.print_status("OK", f"New exercise loaded: {new_title} ({new_total} pages)")
                             return self.auto_solve_exercise(
                                 new_title, selected_pages=None,
@@ -5193,12 +5143,12 @@ class SpeexxBotCLI:
     def _continue_auto_from_results(self, current_title, status, score, elapsed,
                                     seen_titles, continuation_depth):
         try:
+            if self.check_course_progress():
+                self.print_status("OK", "ตรวจพบว่าแบบฝึกหัดครบ 100% แล้ว — หยุดการทำอัตโนมัติเพื่อรอทำแบบทดสอบ")
+                return (status, score, elapsed)
+
             if "/results" not in self.page.url.lower():
-                self.page.goto(
-                    "https://portal.speexx.com/articles/10960433/results",
-                    wait_until="domcontentloaded",
-                    timeout=15000,
-                )
+                self.navigate_to_results()
             self.page.locator("tbody tr.clickable").first.wait_for(
                 state="visible", timeout=15000
             )
@@ -5292,6 +5242,106 @@ class SpeexxBotCLI:
 
         return False
 
+    def multi_account_menu(self):
+        self.print_header()
+        print(f"  {Fore.CYAN}--- โหมดหลายบัญชี (Multi-Account) ---{Style.RESET_ALL}\n")
+        self.accounts = self.load_accounts()
+        if not self.accounts:
+            print(f"  {Fore.YELLOW}ไม่มีบัญชีที่บันทึกไว้{Style.RESET_ALL}")
+            self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+            return
+
+        for i, acc in enumerate(self.accounts, 1):
+            has_pwd = f" {Fore.GREEN}[saved pwd]{Style.RESET_ALL}" if acc.get("password") else ""
+            print(f"  {Fore.WHITE}[{i}]{Style.RESET_ALL} {acc.get('email', '')}{has_pwd}")
+        
+        print(f"  {Fore.WHITE}[A]{Style.RESET_ALL} ทั้งหมด")
+        print(f"  {Fore.WHITE}[0]{Style.RESET_ALL} ย้อนกลับ")
+        
+        try:
+            choice = self._input(f"\n  {Fore.CYAN}[>] เลือกบัญชีที่ต้องการรัน: {Style.RESET_ALL}").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+
+        selected = []
+        if choice.lower() == 'a':
+            selected = self.accounts
+        elif choice == '0' or choice == '':
+            return
+        else:
+            try:
+                idxs = []
+                if '-' in choice:
+                    a, b = choice.split('-')
+                    idxs = list(range(int(a)-1, int(b)))
+                elif ',' in choice:
+                    idxs = [int(x.strip())-1 for x in choice.split(',')]
+                else:
+                    idxs = [int(choice)-1]
+                
+                for idx in idxs:
+                    if 0 <= idx < len(self.accounts):
+                        selected.append(self.accounts[idx])
+            except Exception:
+                self.print_status("ERROR", self.T['invalid_choice'])
+                time.sleep(1)
+                return
+
+        valid_selected = [acc for acc in selected if acc.get("password")]
+        if not valid_selected:
+            self.print_status("ERROR", "ไม่มีบัญชีที่บันทึกรหัสผ่านไว้")
+            self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+            return
+
+        print(f"\n  {Fore.GREEN}กำลังเปิด {len(valid_selected)} บัญชีในหน้าต่างใหม่...{Style.RESET_ALL}")
+        for acc in valid_selected:
+            email = acc.get("email")
+            pwd = acc.get("password")
+            print(f"  {Fore.CYAN}[START]{Style.RESET_ALL} {email}")
+            subprocess.Popen([sys.executable, __file__, "--account", email, "--password", pwd, "--auto"])
+        
+        print(f"\n  {Fore.GREEN}โปรเซสทั้งหมดเริ่มทำงานแล้ว{Style.RESET_ALL}")
+        self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+
+    def auto_run(self, email, password):
+        self.print_status("INFO", f"Auto-run for {email}")
+        if not self.start_browser_and_login(email, password):
+            sys.exit(1)
+            
+        self.navigate_to_results()
+        
+        try:
+            self._ensure_all_exercises_visible()
+            rows = self.page.locator("tbody tr.clickable").all()
+            first_uncompleted = None
+            for row in rows:
+                tds = row.locator("td").all()
+                if len(tds) >= 4:
+                    title = tds[0].inner_text().strip()
+                    score = tds[3].inner_text().strip()
+                    if score != "100":
+                        first_uncompleted = title
+                        break
+            
+            if first_uncompleted:
+                self.print_status("INFO", f"เริ่มทำแบบฝึกหัด: {first_uncompleted}")
+                self.force_solve_all = False
+                self.auto_solve_exercise(
+                    first_uncompleted,
+                    selected_pages=None,
+                    is_continuation=False,
+                    already_opened=False,
+                    auto_continue=True,
+                )
+            else:
+                self.print_status("OK", "ไม่มีแบบฝึกหัดที่ต้องทำเพิ่ม (หรือทำครบ 100% แล้ว)")
+        except Exception as e:
+            self.print_status("ERROR", f"Auto run error: {e}")
+        
+        self.print_status("INFO", "จบการทำงานสำหรับบัญชีนี้")
+        self._cleanup_browser()
+        sys.exit(0)
+
     def after_solve_menu(self):
         while True:
             print(f"\n  {Fore.CYAN}--- {self.T['next_action']} ---{Style.RESET_ALL}")
@@ -5316,7 +5366,6 @@ class SpeexxBotCLI:
                 pass
 
     def shutdown(self):
-       
         self.print_status("INFO", "Exiting...")
         self._save_answer_db(self.current_chapter_name)
         self._cleanup_browser()
@@ -5324,7 +5373,6 @@ class SpeexxBotCLI:
             sys.stdout.flush()
             if hasattr(sys.stdout, 'close'):
                 sys.stdout.close()
-           
             if hasattr(self, 'original_stdout'):
                 sys.stdout = self.original_stdout
         except Exception:
@@ -5359,7 +5407,8 @@ class SpeexxBotCLI:
             print(f"  {Fore.CYAN}--- {self.T['login_menu']} ---{Style.RESET_ALL}\n")
             print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['opt_login']}")
             print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['opt_manage_acc']}")
-            print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_exit']}")
+            print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_multi_acc']}")
+            print(f"  {Fore.WHITE}[4]{Style.RESET_ALL} {self.T['opt_exit']}")
             try:
                 c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
                 if c == "":
@@ -5375,6 +5424,8 @@ class SpeexxBotCLI:
                     self.accounts = self.load_accounts()
                     self.select_account()
                 elif c == "3":
+                    self.multi_account_menu()
+                elif c == "4":
                     self.shutdown()
                 else:
                     self.print_status("ERROR", self.T['invalid_choice'])
@@ -5428,5 +5479,15 @@ class SpeexxBotCLI:
                 self.dashboard_menu()
 
 if __name__ == "__main__":
-    bot = SpeexxBotCLI()
-    bot.main_menu()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--account", type=str)
+    parser.add_argument("--password", type=str)
+    parser.add_argument("--auto", action="store_true")
+    args = parser.parse_args()
+
+    if args.account and args.password and args.auto:
+        bot = SpeexxBotCLI()
+        bot.auto_run(args.account, args.password)
+    else:
+        bot = SpeexxBotCLI()
+        bot.main_menu()
