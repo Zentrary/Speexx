@@ -9,6 +9,9 @@ from .constants import (
     PROJECT_ROOT,
     UNSUPPORTED_TYPES,
 )
+from .speed_config import get as get_speed, get_all as get_all_speeds, set_value as set_speed, reset_defaults as reset_speed_defaults  # noqa: F401
+from .self_healing import SelfHealingEngine
+from .anti_flaky import AntiFlakyDetector
 from .logging_utils import TeeLogger, _TeeLogHandler
 from .solvers import (
     AnswerSolver,
@@ -44,6 +47,12 @@ __all__ = [
     "PROJECT_ROOT",
     "MAIN_SCRIPT_PATH",
     "UNSUPPORTED_TYPES",
+    "get_speed",
+    "get_all_speeds",
+    "set_speed",
+    "reset_speed_defaults",
+    "SelfHealingEngine",
+    "AntiFlakyDetector",
     "TRANSLATIONS",
     "Fore",
     "Style",
