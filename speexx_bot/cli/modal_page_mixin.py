@@ -109,7 +109,7 @@ class ModalAndPageMixin:
         )
         return 0
 
-    def wait_for_exercise_content_ready(self, timeout=6.0):
+    def wait_for_exercise_content_ready(self, timeout=8.5):
         """Wait until the current exercise page has mounted its real type-* class and interactive DOM (or real <video>)."""
         deadline = time.time() + float(timeout)
         start_ts = time.time()
@@ -146,10 +146,10 @@ class ModalAndPageMixin:
                                     )
                                 );
                                 if (hasInner) return true;
-                                if (elapsedSec >= 2.8 && document.querySelector('.exercise-items')) return true;
+                                if (elapsedSec >= 3.2 && document.querySelector('.exercise-items')) return true;
                             }
 
-                            if (elapsedSec >= 1.2) {
+                            if (elapsedSec >= 1.5) {
                                 const hasVisVideo = Array.from(document.querySelectorAll('video')).some(v => {
                                     if (!isVis(v)) return false;
                                     return Boolean(v.currentSrc || v.src || v.getAttribute('src') || v.querySelector('source[src]') || v.readyState > 0);
@@ -163,10 +163,11 @@ class ModalAndPageMixin:
                     )
                 )
                 if ready:
+                    time.sleep(0.45)
                     return True
             except Exception:
                 pass
-            time.sleep(0.1)
+            time.sleep(0.18)
         return False
 
     def navigate_to_exercise_page(self, num):
@@ -210,7 +211,8 @@ class ModalAndPageMixin:
             if nav_info.get("alreadyActive") and (
                 num == 1 or "/exercise/" not in cur_clean_url or cur_clean_url.endswith(f"/exercise/{int(num)}")
             ):
-                self.wait_for_exercise_content_ready(timeout=6.0)
+                self.wait_for_exercise_content_ready(timeout=8.0)
+                time.sleep(0.3)
                 return True
 
             prev_url = ""
@@ -226,16 +228,16 @@ class ModalAndPageMixin:
 
             # Wait briefly for route `/exercise/<num>` update when SPA uses numbered exercise URLs
             if "/exercise/" in prev_url:
-                url_deadline = time.time() + 2.5
+                url_deadline = time.time() + 4.0
                 expected_suffix = f"/exercise/{int(num)}"
                 while time.time() < url_deadline:
                     cur_u = (self.page.url or "").split("?")[0]
                     if cur_u.endswith(expected_suffix):
                         break
-                    time.sleep(0.06)
+                    time.sleep(0.12)
 
-            self.wait_for_exercise_content_ready(timeout=5.5)
-            time.sleep(0.1)
+            self.wait_for_exercise_content_ready(timeout=8.0)
+            time.sleep(0.45)
             return True
         except Exception as e:
             self.logger.debug(f"[NAV] navigate_to_exercise_page({num}) error: {e}")

@@ -191,7 +191,8 @@ class ExerciseRunnerMixin:
                                 )
                             except Exception:
                                 pass
-                self.wait_for_exercise_content_ready(timeout=6.0)
+                self.wait_for_exercise_content_ready(timeout=8.0)
+                time.sleep(0.4)
 
             self._ensure_chapter_db_loaded(announce=False)
 
@@ -311,9 +312,10 @@ class ExerciseRunnerMixin:
                         early_modal_completed = True
                         break
                 else:
-                    self.wait_for_exercise_content_ready(timeout=6.0)
+                    self.wait_for_exercise_content_ready(timeout=8.0)
+                    time.sleep(0.5)
 
-                et = engine.detect_type(wait_timeout=6.0)
+                et = engine.detect_type(wait_timeout=7.5)
                 if et == "unknown" and self.detect_completion_modal() and not effective_force:
                     early_modal_completed = True
                     break
@@ -393,7 +395,7 @@ class ExerciseRunnerMixin:
                             extra={"error": str(e)},
                         )
                     if vid_res == "RE_DETECT":
-                        et = engine.detect_type(wait_timeout=4.5)
+                        et = engine.detect_type(wait_timeout=6.0)
                         self.print_status("PAGE", f"{self.T['page']} {i}/{total_pages} | {self.T['type']}: {et}")
                         solver = engine.get_solver(
                             et,
@@ -739,7 +741,8 @@ class ExerciseRunnerMixin:
                                 chain_direction=chain_direction,
                             )
 
-                        self.wait_for_exercise_content_ready(timeout=6.5)
+                        self.wait_for_exercise_content_ready(timeout=8.5)
+                        time.sleep(0.6)
 
                         new_total = self.get_total_exercises(
                             retries=4,
