@@ -128,9 +128,7 @@ TRANSLATIONS = {
         "table_review": "ทบทวน",
 
         "exercise_menu": "เมนูแบบฝึกหัด",
-        "opt_view": "เปิดดูเฉยๆ (Just view)",
         "opt_dump": "Dump ทุกหน้า",
-        "opt_auto_solve": "ทำแบบฝึกหัดอัตโนมัติ (Auto Solve)",
         "opt_new_learning_path": "ทำแบบฝึกหัดใหม่ต่อเนื่อง (เริ่มรายการแรกและ Continue อัตโนมัติ)",
         "select_pages": "เลือกข้อที่ต้องการทำ (เช่น 1, 1-5, all): ",
 
@@ -270,9 +268,7 @@ TRANSLATIONS = {
         "table_review": "Review",
 
         "exercise_menu": "Exercise Menu",
-        "opt_view": "Open (Just view)",
         "opt_dump": "Dump All Pages",
-        "opt_auto_solve": "Auto Solve (Keep trying until >= 51)",
         "opt_new_learning_path": "New learning path (start at first selected and auto-Continue)",
         "select_pages": "Select pages (e.g. 1, 1-5, all): ",
 
@@ -4656,105 +4652,286 @@ class SpeexxBotCLI:
                     pass
             return False
 
+    def _count_visible_exercise_rows(self):
+        if not self.page:
+            return 0
+        try:
+            return int(self.page.evaluate("""
+                () => {
+                    const rows = document.querySelectorAll('tbody tr.clickable');
+                    let count = 0;
+                    for (const row of rows) {
+                        let cur = row;
+                        let hidden = false;
+                        while (cur && cur.nodeType === 1) {
+                            if (cur.hasAttribute('hidden') || cur.getAttribute('aria-hidden') === 'true' ||
+                                (cur.dataset && cur.dataset.hidden === 'true')) {
+                                hidden = true;
+                                break;
+                            }
+                            const cls = (cur.className && cur.className.baseVal !== undefined
+                                ? cur.className.baseVal : (cur.className || '')).toString().toLowerCase();
+                            if (/(^|\\s)(ng-hide|d-none|hidden|u-hidden)(\\s|$)/.test(cls)) {
+                                hidden = true;
+                                break;
+                            }
+                            const st = window.getComputedStyle(cur);
+                            if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') {
+                                hidden = true;
+                                break;
+                            }
+                            cur = cur.parentElement;
+                        }
+                        if (hidden) continue;
+                        const rect = row.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) count++;
+                    }
+                    return count;
+                }
+            """) or 0)
+        except Exception:
+            return 0
+
+    def _get_visible_exercise_rows(self):
+        if not self.page:
+            return []
+        try:
+            visible_indices = self.page.evaluate("""
+                () => {
+                    const rows = Array.from(document.querySelectorAll('tbody tr.clickable'));
+                    const indices = [];
+                    rows.forEach((row, idx) => {
+                        let cur = row;
+                        let hidden = false;
+                        while (cur && cur.nodeType === 1) {
+                            if (cur.hasAttribute('hidden') || cur.getAttribute('aria-hidden') === 'true' ||
+                                (cur.dataset && cur.dataset.hidden === 'true')) {
+                                hidden = true;
+                                break;
+                            }
+                            const cls = (cur.className && cur.className.baseVal !== undefined
+                                ? cur.className.baseVal : (cur.className || '')).toString().toLowerCase();
+                            if (/(^|\\s)(ng-hide|d-none|hidden|u-hidden)(\\s|$)/.test(cls)) {
+                                hidden = true;
+                                break;
+                            }
+                            const st = window.getComputedStyle(cur);
+                            if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') {
+                                hidden = true;
+                                break;
+                            }
+                            cur = cur.parentElement;
+                        }
+                        if (!hidden) {
+                            const rect = row.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                indices.push(idx);
+                            }
+                        }
+                    });
+                    return indices;
+                }
+            """) or []
+            base = self.page.locator("tbody tr.clickable")
+            return [base.nth(idx) for idx in visible_indices]
+        except Exception as e:
+            self.logger.debug(f"[ROWS] _get_visible_exercise_rows error: {e}")
+            return []
+
+    def _wait_for_visible_exercise_rows(self, timeout_ms=15000):
+        deadline = time.time() + max(0.5, timeout_ms / 1000.0)
+        while time.time() < deadline:
+            if self._count_visible_exercise_rows() > 0:
+                return True
+            if self._find_show_more_expander() is not None:
+                return True
+            time.sleep(0.25)
+        return self._count_visible_exercise_rows() > 0
+
     def _find_show_more_expander(self):
         if not self.page:
             return None
-        collapse_keywords = (
-            "show less",
-            "see less",
-            "view less",
-            "less",
-            "แสดงน้อยลง",
-            "ดูน้อยลง",
-            "น้อยลง",
-            "ย่อ",
-            "ซ่อน",
-            "collapse",
-        )
-        expand_keywords = (
-            "show more",
-            "see more",
-            "load more",
-            "view more",
-            "แสดงเพิ่มเติม",
-            "ดูเพิ่มเติม",
-            "โหลดเพิ่มเติม",
-            "เพิ่มเติม",
-        )
-        candidate_selectors = [
-            "div.show-more",
-            "[aria-label*='แสดงเพิ่มเติม']",
-            "[aria-label*='Show more' i]",
-            "[aria-label*='See more' i]",
-            "button:has-text('แสดงเพิ่มเติม')",
-            "button:has-text('Show more')",
-            "div[role='button']:has-text('แสดงเพิ่มเติม')",
-            "div[role='button']:has-text('Show more')",
-        ]
-        for sel in candidate_selectors:
-            try:
-                loc = self.page.locator(sel)
-                count = loc.count()
-                for idx in range(count):
-                    item = loc.nth(idx)
-                    try:
-                        if not item.is_visible(timeout=400):
-                            continue
-                        info = item.evaluate("""
-                            (el) => {
-                                const txt = (el.innerText || el.textContent || '').trim();
-                                const aria = (el.getAttribute('aria-label') || '').trim();
-                                const title = (el.getAttribute('title') || '').trim();
-                                const cls = (el.className || '').toString().toLowerCase();
-                                const iconHtml = Array.from(el.querySelectorAll('i, svg, span'))
-                                    .map(n => (n.className && n.className.baseVal !== undefined
-                                        ? n.className.baseVal : (n.className || '')).toString().toLowerCase())
-                                    .join(' ');
-                                const hasUpIcon = /(chevron-up|angle-up|arrow-up|caret-up|expand-less)/.test(
-                                    cls + ' ' + iconHtml
-                                );
-                                return {
-                                    combined: (txt + ' ' + aria + ' ' + title).toLowerCase(),
-                                    isShowMoreClass: cls.includes('show-more'),
-                                    hasUpIcon,
-                                };
-                            }
-                        """)
-                        combined = (info.get("combined") or "").strip()
-                        if info.get("hasUpIcon"):
-                            continue
-                        if any(ck in combined for ck in collapse_keywords):
-                            continue
-                        if any(ek in combined for ek in expand_keywords) or (
-                            info.get("isShowMoreClass") and not combined
-                        ):
-                            return item
-                    except Exception:
-                        continue
-            except Exception:
-                continue
+        try:
+            found = self.page.evaluate("""
+                () => {
+                    document.querySelectorAll('[data-speexx-expander-target]').forEach(el => {
+                        el.removeAttribute('data-speexx-expander-target');
+                    });
+
+                    const isNodeHidden = (el) => {
+                        if (!el || el.nodeType !== 1) return false;
+                        if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true' ||
+                            (el.dataset && el.dataset.hidden === 'true')) return true;
+                        const cls = (el.className && el.className.baseVal !== undefined
+                            ? el.className.baseVal : (el.className || '')).toString().toLowerCase();
+                        if (/(^|\\s)(ng-hide|d-none|hidden|u-hidden)(\\s|$)/.test(cls)) return true;
+                        const st = window.getComputedStyle(el);
+                        return st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0';
+                    };
+
+                    const isVisibleChain = (el) => {
+                        let cur = el;
+                        while (cur && cur.nodeType === 1) {
+                            if (isNodeHidden(cur)) return false;
+                            cur = cur.parentElement;
+                        }
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+
+                    const getVisibleText = (node) => {
+                        if (!node) return '';
+                        if (node.nodeType === 3) return node.nodeValue || '';
+                        if (node.nodeType !== 1) return '';
+                        const tag = (node.tagName || '').toUpperCase();
+                        if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return '';
+                        if (isNodeHidden(node)) return '';
+                        let out = '';
+                        for (const child of node.childNodes) {
+                            out += ' ' + getVisibleText(child);
+                        }
+                        return out;
+                    };
+
+                    const hasVisibleUpIcon = (el) => {
+                        const checkCls = (node) => {
+                            const c = (node.className && node.className.baseVal !== undefined
+                                ? node.className.baseVal : (node.className || '')).toString().toLowerCase();
+                            return /(chevron-up|angle-up|arrow-up|caret-up|expand-less|up-arrow)/.test(c);
+                        };
+                        if (checkCls(el)) return true;
+                        for (const sub of el.querySelectorAll('i, svg, span, path, use')) {
+                            if (!isVisibleChain(sub)) continue;
+                            if (checkCls(sub)) return true;
+                        }
+                        return false;
+                    };
+
+                    const collapseRe = /(\\bshow\\s*less\\b|\\bsee\\s*less\\b|\\bview\\s*less\\b|\\bload\\s*less\\b|\\bcollapse\\b|แสดงน้อยลง|ดูน้อยลง|น้อยลง|ย่อรายการ|ซ่อนรายการ)/i;
+                    const expandRe = /(\\bshow\\s*more\\b|\\bsee\\s*more\\b|\\bload\\s*more\\b|\\bview\\s*more\\b|แสดงเพิ่มเติม|ดูเพิ่มเติม|โหลดเพิ่มเติม)/i;
+
+                    const cleanLabel = (s) => (s || '')
+                        .replace(/[⌄∨▼▾⌃∧▲▴+…•·]/g, ' ')
+                        .replace(/\\s+/g, ' ')
+                        .trim();
+
+                    const allEls = Array.from(document.querySelectorAll(
+                        "div.show-more, [class*='show-more'], button, a, [role='button'], span, div, td, p, li"
+                    ));
+
+                    const candidates = [];
+                    for (const el of allEls) {
+                        if (el.closest && el.closest('tbody tr.clickable')) continue;
+                        if (el.querySelector && el.querySelector('table, tbody, tr.clickable')) continue;
+                        if (!isVisibleChain(el)) continue;
+                        if (hasVisibleUpIcon(el)) continue;
+
+                        const rawVis = getVisibleText(el);
+                        if (/[⌃∧▲▴]/.test(rawVis)) continue;
+
+                        const visClean = cleanLabel(rawVis);
+                        const ariaClean = cleanLabel(el.getAttribute('aria-label') || '');
+                        const titleClean = cleanLabel(el.getAttribute('title') || '');
+                        const cls = (el.className && el.className.baseVal !== undefined
+                            ? el.className.baseVal : (el.className || '')).toString().toLowerCase();
+                        const isShowMoreClass = /(^|[\\s_-])show-more($|[\\s_-])/.test(cls);
+
+                        if (visClean && collapseRe.test(visClean)) continue;
+                        if (!visClean && (collapseRe.test(ariaClean) || collapseRe.test(titleClean))) continue;
+                        if (visClean.length > 80) continue;
+
+                        const visMatches = expandRe.test(visClean) || visClean === 'เพิ่มเติม';
+                        const attrMatches = !visClean && (
+                            expandRe.test(ariaClean) || expandRe.test(titleClean) ||
+                            ariaClean === 'เพิ่มเติม' || titleClean === 'เพิ่มเติม'
+                        );
+                        const emptyClassMatches = isShowMoreClass && !visClean && !ariaClean && !titleClean;
+
+                        if (!visMatches && !attrMatches && !emptyClassMatches) continue;
+
+                        const tag = (el.tagName || '').toUpperCase();
+                        let priority = 0;
+                        if (isShowMoreClass) priority += 100;
+                        if (tag === 'BUTTON' || tag === 'A' || el.getAttribute('role') === 'button') priority += 60;
+                        if (el.hasAttribute('onclick') || el.hasAttribute('ng-click')) priority += 40;
+                        const st = window.getComputedStyle(el);
+                        if (st.cursor === 'pointer') priority += 30;
+                        // Prefer tighter/deeper elements over outer layout wrappers
+                        let depth = 0;
+                        let p = el;
+                        while (p) { depth++; p = p.parentElement; }
+
+                        candidates.push({
+                            el,
+                            priority,
+                            textLen: visClean.length || ariaClean.length || 1,
+                            depth,
+                        });
+                    }
+
+                    if (!candidates.length) return false;
+
+                    candidates.sort((a, b) => {
+                        if (b.priority !== a.priority) return b.priority - a.priority;
+                        if (a.textLen !== b.textLen) return a.textLen - b.textLen;
+                        return b.depth - a.depth;
+                    });
+
+                    candidates[0].el.setAttribute('data-speexx-expander-target', 'true');
+                    return true;
+                }
+            """)
+            if found:
+                return self.page.locator("[data-speexx-expander-target='true']").first
+        except Exception as e:
+            self.logger.debug(f"[EXPAND] _find_show_more_expander error: {e}")
         return None
 
     def _ensure_all_exercises_visible(self):
         try:
-            max_attempts = 30
+            max_attempts = 50
             stagnant_clicks = 0
             for attempt in range(max_attempts):
+                try:
+                    self.page.evaluate("""
+                        () => {
+                            const rows = Array.from(document.querySelectorAll('tbody tr.clickable'));
+                            for (let i = rows.length - 1; i >= 0; i--) {
+                                const r = rows[i].getBoundingClientRect();
+                                if (r.width > 0 && r.height > 0) {
+                                    rows[i].scrollIntoView({ block: 'end' });
+                                    break;
+                                }
+                            }
+                        }
+                    """)
+                except Exception:
+                    pass
+
                 btn = self._find_show_more_expander()
                 if btn is None:
-                    self.logger.info("[EXPAND] All exercises visible (no active 'Show more' expander)")
+                    vis_now = self._count_visible_exercise_rows()
+                    self.logger.info(
+                        f"[EXPAND] All exercises visible (visible_rows={vis_now}, no active 'Show more' expander)"
+                    )
                     return True
 
+                before_vis = self._count_visible_exercise_rows()
                 try:
-                    before_rows = self.page.locator("tbody tr.clickable").count()
+                    before_dom = self.page.locator("tbody tr.clickable").count()
                 except Exception:
-                    before_rows = 0
+                    before_dom = 0
 
                 clicked = False
                 try:
                     btn.scroll_into_view_if_needed(timeout=2000)
                 except Exception:
-                    pass
+                    try:
+                        btn.evaluate("el => el.scrollIntoView({block: 'center'})")
+                    except Exception:
+                        pass
+                time.sleep(0.15)
+
                 for use_force in (False, True):
                     try:
                         btn.click(timeout=3000, force=use_force)
@@ -4770,24 +4947,31 @@ class SpeexxBotCLI:
                         self.logger.error(f"[EXPAND] Click failed: {e}")
                         return False
 
-                self.logger.info(f"[EXPAND] Clicked 'Show more' #{attempt + 1} (rows before={before_rows})")
+                self.logger.info(
+                    f"[EXPAND] Clicked 'Show more' #{attempt + 1} "
+                    f"(visible_before={before_vis}, dom_before={before_dom})"
+                )
 
-                after_rows = before_rows
-                for _ in range(10):
+                after_vis = before_vis
+                after_dom = before_dom
+                for _ in range(16):
                     time.sleep(0.25)
+                    after_vis = self._count_visible_exercise_rows()
                     try:
-                        after_rows = self.page.locator("tbody tr.clickable").count()
+                        after_dom = self.page.locator("tbody tr.clickable").count()
                     except Exception:
-                        after_rows = before_rows
-                    if after_rows > before_rows:
+                        after_dom = before_dom
+                    if after_vis > before_vis or after_dom > before_dom:
                         break
                     if self._find_show_more_expander() is None:
                         break
 
-                if after_rows <= before_rows:
+                if after_vis <= before_vis and after_dom <= before_dom:
+                    if self._find_show_more_expander() is None:
+                        return True
                     stagnant_clicks += 1
-                    if stagnant_clicks >= 2:
-                        self.logger.info("[EXPAND] Row count stopped increasing; stopping expansion")
+                    if stagnant_clicks >= 3:
+                        self.logger.info("[EXPAND] Visible/DOM row count stopped increasing; stopping expansion")
                         return True
                 else:
                     stagnant_clicks = 0
@@ -5298,7 +5482,39 @@ class SpeexxBotCLI:
             pass
         return default
 
-    def _click_exercises_tab(self):
+    def _is_exercises_tab_active(self):
+        if not self.page:
+            return False
+        try:
+            return bool(self.page.evaluate("""
+                () => {
+                    const cands = Array.from(document.querySelectorAll(
+                        "#results-table-exercises, [id*='results-table-exercises'], [role='tab'], button, a, li"
+                    ));
+                    for (const el of cands) {
+                        const id = (el.id || '').toLowerCase();
+                        const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        const isExTab = id.includes('results-table-exercises') ||
+                            txt === 'exercises' || txt === 'แบบฝึกหัด';
+                        if (!isExTab) continue;
+                        const cls = ((el.className || '') + ' ' +
+                            ((el.parentElement && el.parentElement.className) || '')).toLowerCase();
+                        const aria = (el.getAttribute('aria-selected') || '').toLowerCase();
+                        if (aria === 'true' || /(^|[-_\\s])(active|selected|current)([-_\\s]|$)/.test(cls)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """))
+        except Exception:
+            return False
+
+    def _click_exercises_tab(self, force=False):
+        if not self.page:
+            return False
+        if not force and self._is_exercises_tab_active() and self._count_visible_exercise_rows() > 0:
+            return True
         selectors = [
             "#results-table-exercises",
             "[id*='results-table-exercises']",
@@ -5320,15 +5536,184 @@ class SpeexxBotCLI:
                     try:
                         if tab.is_visible(timeout=800):
                             tab.scroll_into_view_if_needed()
-                            time.sleep(0.3)
+                            time.sleep(0.2)
                             tab.click(timeout=5000)
-                            time.sleep(0.8)
+                            time.sleep(0.6)
                             return True
                     except Exception:
                         continue
             except Exception:
                 continue
         return False
+
+    def _activate_chapter_on_results(self, cid=None, name=None, force_click=False):
+        if not self.page:
+            return False
+        target_cid = str(cid).strip() if cid is not None and str(cid).strip() else (
+            str(self.current_chapter_cid).strip() if self.current_chapter_cid else ""
+        )
+        target_name = (name if name is not None else (self.current_chapter_name or "")).strip()
+        if not target_cid and (not target_name or target_name == self.DEFAULT_CHAPTER_NAME):
+            return True
+
+        try:
+            self.page.locator(".level-container").first.wait_for(state="visible", timeout=15000)
+        except Exception:
+            return False
+
+        try:
+            state = self.page.evaluate(
+                """
+                ([cid, name]) => {
+                    document.querySelectorAll('[data-speexx-chapter-target]').forEach(el => {
+                        el.removeAttribute('data-speexx-chapter-target');
+                    });
+                    const containers = Array.from(document.querySelectorAll('.level-container'));
+                    if (!containers.length) return { found: false, alreadyActive: false, resolvedCid: null, resolvedName: null };
+
+                    const normName = (name || '').trim().toLowerCase();
+                    let matched = null;
+                    if (cid) {
+                        matched = containers.find(c => (c.getAttribute('data-id') || '').trim() === cid) || null;
+                    }
+                    if (!matched && normName) {
+                        matched = containers.find(c => {
+                            const tEl = c.querySelector('.level-text') || c.querySelector('.level-inside-box') || c;
+                            const txt = (tEl.innerText || tEl.textContent || '').trim().toLowerCase();
+                            return txt === normName;
+                        }) || null;
+                    }
+                    if (!matched) {
+                        return { found: false, alreadyActive: false, resolvedCid: null, resolvedName: null };
+                    }
+
+                    const box = matched.querySelector('.level-inside-box') || matched;
+                    box.setAttribute('data-speexx-chapter-target', 'true');
+
+                    const isExplicitActive = (el) => {
+                        const b = el.querySelector('.level-inside-box');
+                        const cls = ((el.className || '') + ' ' + ((b && b.className) || '')).toLowerCase();
+                        const aria = (el.getAttribute('aria-selected') || (b && b.getAttribute('aria-selected')) || '').toLowerCase();
+                        return aria === 'true' || /(^|[-_\\s])(active|selected|current|open)([-_\\s]|$)/.test(cls);
+                    };
+
+                    const otherActive = containers.some(c => c !== matched && isExplicitActive(c));
+                    const alreadyActive = isExplicitActive(matched) && !otherActive;
+                    const tEl = matched.querySelector('.level-text') || box;
+                    const resolvedName = (tEl.innerText || tEl.textContent || '').trim() || null;
+                    const resolvedCid = matched.getAttribute('data-id') || null;
+                    let firstRowTitle = '';
+                    for (const r of document.querySelectorAll('tbody tr.clickable')) {
+                        const rect = r.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            const td = r.querySelector('td');
+                            firstRowTitle = td ? (td.innerText || td.textContent || '').trim() : '';
+                            if (firstRowTitle) break;
+                        }
+                    }
+
+                    return { found: true, alreadyActive, resolvedCid, resolvedName, firstRowTitle };
+                }
+                """,
+                [target_cid, target_name],
+            )
+        except Exception as e:
+            self.logger.debug(f"[CHAPTER] inspect failed: {e}")
+            return False
+
+        if not state or not state.get("found"):
+            self.logger.warning(f"[CHAPTER] Target chapter not found in DOM (cid={target_cid}, name={target_name})")
+            return False
+
+        if state.get("resolvedCid") and not self.current_chapter_cid:
+            self.current_chapter_cid = state["resolvedCid"]
+        if state.get("resolvedName") and (not self.current_chapter_name or self.current_chapter_name == self.DEFAULT_CHAPTER_NAME):
+            self.current_chapter_name = state["resolvedName"]
+
+        was_already_active = bool(state.get("alreadyActive"))
+        if not force_click and was_already_active and self._count_visible_exercise_rows() > 0:
+            return True
+
+        prev_first_title = state.get("firstRowTitle") or ""
+        chapter_box = self.page.locator("[data-speexx-chapter-target='true']").first
+        try:
+            chapter_box.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+
+        clicked = False
+        for use_force in (False, True):
+            try:
+                chapter_box.click(timeout=8000, force=use_force)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            try:
+                chapter_box.evaluate("el => el.click()")
+                clicked = True
+            except Exception as e:
+                self.logger.error(f"[CHAPTER] Click failed for {target_name}: {e}")
+                return False
+
+        # Wait for the chapter's live exercise list to finish updating in the DOM
+        wait_window = 0.8 if (was_already_active and prev_first_title) else 5.0
+        deadline = time.time() + wait_window
+        while time.time() < deadline:
+            time.sleep(0.25)
+            try:
+                settled = self.page.evaluate(
+                    """
+                    ([prevTitle]) => {
+                        let curTitle = '';
+                        for (const r of document.querySelectorAll('tbody tr.clickable')) {
+                            const rect = r.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {
+                                const td = r.querySelector('td');
+                                curTitle = td ? (td.innerText || td.textContent || '').trim() : '';
+                                if (curTitle) break;
+                            }
+                        }
+                        return {
+                            changed: Boolean(curTitle && curTitle !== prevTitle),
+                            hasRows: Boolean(curTitle),
+                        };
+                    }
+                    """,
+                    [prev_first_title],
+                )
+                if settled:
+                    if settled.get("changed"):
+                        break
+                    if was_already_active and settled.get("hasRows"):
+                        break
+            except Exception:
+                break
+        time.sleep(0.3)
+        return True
+
+    def _ensure_results_chapter_and_exercises_ready(self, force_chapter_click=False, wait_timeout=15000):
+        if not self.page:
+            return False
+        if "/results" not in (self.page.url or "").lower():
+            if not self.navigate_to_results():
+                return False
+            force_chapter_click = False
+
+        if self.current_chapter_cid or (
+            self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
+        ):
+            self._activate_chapter_on_results(
+                self.current_chapter_cid,
+                self.current_chapter_name,
+                force_click=force_chapter_click,
+            )
+
+        self._click_exercises_tab(force=force_chapter_click)
+        self._wait_for_visible_exercise_rows(timeout_ms=wait_timeout)
+        self._ensure_all_exercises_visible()
+        return True
 
     def check_course_progress(self):
         try:
@@ -5379,20 +5764,17 @@ class SpeexxBotCLI:
 
             self.page.locator(".level-container").first.wait_for(state="visible", timeout=15000)
 
-            if self.current_chapter_cid:
-                chapter_box = self.page.locator(
-                    f".level-container[data-id='{self.current_chapter_cid}'] .level-inside-box"
+            if self.current_chapter_cid or (
+                self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
+            ):
+                self._activate_chapter_on_results(
+                    self.current_chapter_cid,
+                    self.current_chapter_name,
+                    force_click=True,
                 )
-                if chapter_box.count() > 0:
-                    chapter_box.click(timeout=10000)
-                    time.sleep(1)
 
-            self._click_exercises_tab()
-
-            try:
-                self.page.locator("tbody tr.clickable").first.wait_for(state="attached", timeout=8000)
-            except Exception:
-                self.logger.debug("[NAV] Exercise table not ready yet")
+            self._click_exercises_tab(force=True)
+            self._wait_for_visible_exercise_rows(timeout_ms=8000)
 
             self._ensure_chapter_db_loaded(announce=False)
             self.print_status("OK", "Results loaded via Dashboard.")
@@ -5404,20 +5786,16 @@ class SpeexxBotCLI:
                 self.page.locator(".level-container").first.wait_for(
                     state="visible", timeout=15000
                 )
-                if self.current_chapter_cid:
-                    chapter_box = self.page.locator(
-                        f".level-container[data-id='{self.current_chapter_cid}'] .level-inside-box"
+                if self.current_chapter_cid or (
+                    self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
+                ):
+                    self._activate_chapter_on_results(
+                        self.current_chapter_cid,
+                        self.current_chapter_name,
+                        force_click=True,
                     )
-                    if chapter_box.count() > 0:
-                        chapter_box.click(timeout=10000)
-                        time.sleep(1)
-                self._click_exercises_tab()
-                try:
-                    self.page.locator("tbody tr.clickable").first.wait_for(
-                        state="attached", timeout=8000
-                    )
-                except Exception:
-                    self.logger.debug("[NAV] Exercise table not ready yet")
+                self._click_exercises_tab(force=True)
+                self._wait_for_visible_exercise_rows(timeout_ms=8000)
                 self._ensure_chapter_db_loaded(announce=False)
                 self.print_status("OK", "Results loaded via fallback.")
                 return True
@@ -5485,23 +5863,22 @@ class SpeexxBotCLI:
     def select_chapter(self, cid, name):
         self.print_status("WAIT", f"Selecting {name}...")
         try:
-            if "/results" not in self.page.url.lower():
-                if not self.navigate_to_results():
-                    return
-
             self.current_chapter_cid = cid
             self.current_chapter_name = name
             self._load_answer_db(name, announce=True)
 
-            chapter_box = self.page.locator(
-                f".level-container[data-id='{cid}'] .level-inside-box"
+            already_navigated = False
+            if "/results" not in (self.page.url or "").lower():
+                if not self.navigate_to_results():
+                    return
+                already_navigated = True
+
+            self._ensure_results_chapter_and_exercises_ready(
+                force_chapter_click=not already_navigated,
+                wait_timeout=15000,
             )
-            chapter_box.wait_for(state="visible", timeout=15000)
-            chapter_box.click(timeout=10000)
-            time.sleep(1)
-            self._click_exercises_tab()
             self.print_status("OK", f"{name} selected.")
-            self.fetch_exercises()
+            self.fetch_exercises(_already_prepared=True)
         except Exception as e:
             self.print_status("ERROR", f"Error: {str(e)}")
             self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
@@ -5606,18 +5983,21 @@ class SpeexxBotCLI:
             self.logger.debug(f"[ROW] inspect failed: {e}")
         return info
 
-    def fetch_exercises(self):
+    def fetch_exercises(self, _already_prepared=False):
         self.print_header()
         print(f"  {Fore.CYAN}--- {self.T['exercise_list']} ---{Style.RESET_ALL}\n")
         try:
             self._ensure_chapter_db_loaded(announce=False)
-            self._click_exercises_tab()
-            self._ensure_all_exercises_visible()
+            if not _already_prepared:
+                self._ensure_results_chapter_and_exercises_ready(
+                    force_chapter_click=False,
+                    wait_timeout=15000,
+                )
+            else:
+                self._wait_for_visible_exercise_rows(timeout_ms=15000)
+                self._ensure_all_exercises_visible()
 
-            self.page.locator("tbody tr.clickable").first.wait_for(
-                state="visible", timeout=15000
-            )
-            rows = self.page.locator("tbody tr.clickable").all()
+            rows = self._get_visible_exercise_rows()
             if not rows:
                 self.print_status("ERROR", self.T['no_exercises'])
                 self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
@@ -5679,7 +6059,7 @@ class SpeexxBotCLI:
                     })
             self.chapter_catalog = new_catalog
             self.logger.info(
-                "[DB] Chapter catalogue: %s unique exercises (%s table rows)",
+                "[DB] Chapter catalogue: %s unique exercises (%s live web rows)",
                 len(self.chapter_catalog),
                 len(exercises),
             )
@@ -5714,9 +6094,8 @@ class SpeexxBotCLI:
                         f"{self.T['multi_select_mode_title'].format(len(selected))} "
                         f"---{Style.RESET_ALL}"
                     )
-                    print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['opt_one_by_one']}")
-                    print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['opt_all_auto']}")
-                    print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_new_learning_path']}")
+                    print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['opt_new_learning_path']}")
+                    print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['opt_one_by_one']}")
 
                     try:
                         mode = self._input(
@@ -5726,14 +6105,12 @@ class SpeexxBotCLI:
                         mode = "1"
 
                     if mode == "2":
-                        self.auto_solve_batch(selected_items)
-                    elif mode == "3":
-                        t0, r0 = selected_items[0]
-                        self.start_new_learning_path(t0, row_index=r0)
-                    else:
                         for t_item, r_item in selected_items:
                             self.open_exercise_menu(t_item, row_index=r_item)
                             time.sleep(0.5)
+                    else:
+                        t0, r0 = selected_items[0]
+                        self.start_new_learning_path(t0, row_index=r0)
 
             except ValueError:
                 pass
@@ -5744,47 +6121,19 @@ class SpeexxBotCLI:
     def open_exercise_menu(self, title, row_index=None):
         self.print_header()
         print(f"  {Fore.CYAN}--- {self.T['exercise_menu']}: {title} ---{Style.RESET_ALL}\n")
-        print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['opt_view']}")
+        print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['opt_new_learning_path']}")
         print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['opt_dump']}")
-        print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_auto_solve']}")
-        print(f"  {Fore.WHITE}[4]{Style.RESET_ALL} {self.T['opt_new_learning_path']}")
         print(f"  {Fore.WHITE}[0]{Style.RESET_ALL} {self.T['back']}")
         try:
             c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
             if c == "" or c == "0":
                 return
             if c == "1":
-                self.click_exercise(title, row_index=row_index)
+                self.start_new_learning_path(title, row_index=row_index)
             elif c == "2":
                 self.dump_all_exercise_pages(title, row_index=row_index)
-            elif c == "3":
-                force = self._ask_solve_mode()
-                if force is None:
-                    return
-                self.force_solve_all = force
-                self.auto_solve_exercise(
-                    title,
-                    selected_pages=None,
-                    is_continuation=False,
-                    already_opened=False,
-                    row_index=row_index,
-                )
-            elif c == "4":
-                self.start_new_learning_path(title, row_index=row_index)
         except ValueError:
             pass
-
-    def click_exercise(self, title, row_index=None):
-        self.print_status("WAIT", f"Opening {title}...")
-        try:
-            if not self._click_row_safely(title, row_index=row_index):
-                self.print_status("ERROR", f"Cannot open '{title}'")
-            else:
-                self.print_status("OK", "Opened.")
-            self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
-        except Exception as e:
-            self.print_status("ERROR", f"Error: {str(e)}")
-            self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
 
     def dump_all_exercise_pages(self, title, row_index=None):
         self.print_status("INFO", f"Dumping {title}...")
@@ -6610,6 +6959,17 @@ class SpeexxBotCLI:
                     )
                 except Exception as e:
                     self.logger.warning(f"[WAIT] Exercise page not ready: {str(e)[:80]}")
+                    if "/results" in (self.page.url or "").lower():
+                        self.logger.info("[WAIT] Still on /results after row click; retrying inner cell click...")
+                        if self._click_row_safely(title, row_index=row_index, click_inner_cell=True):
+                            try:
+                                self.page.wait_for_selector(
+                                    ".exercise, .video, .exercises-large-navigation li",
+                                    state="visible",
+                                    timeout=12000
+                                )
+                            except Exception:
+                                pass
                 time.sleep(1.5)
 
             self._ensure_chapter_db_loaded(announce=False)
@@ -6623,13 +6983,19 @@ class SpeexxBotCLI:
                 total_pages = self.get_total_exercises()
 
             if total_pages == 0:
-                self.logger.warning("[TOTAL] First attempt = 0, retrying with reload...")
-                try:
-                    self.page.reload(wait_until="domcontentloaded", timeout=15000)
-                    time.sleep(2)
-                    total_pages = self.get_total_exercises()
-                except Exception as e:
-                    self.logger.error(f"[TOTAL] Reload failed: {e}")
+                if "/results" in (self.page.url or "").lower():
+                    self.logger.warning("[TOTAL] Still on /results (total=0), re-selecting chapter & clicking row...")
+                    if self._click_row_safely(title, row_index=row_index, click_inner_cell=True):
+                        time.sleep(2)
+                        total_pages = self.get_total_exercises()
+                else:
+                    self.logger.warning("[TOTAL] First attempt = 0, retrying with reload...")
+                    try:
+                        self.page.reload(wait_until="domcontentloaded", timeout=15000)
+                        time.sleep(2)
+                        total_pages = self.get_total_exercises()
+                    except Exception as e:
+                        self.logger.error(f"[TOTAL] Reload failed: {e}")
 
             if total_pages == 0:
                 try:
@@ -7103,14 +7469,11 @@ class SpeexxBotCLI:
                 self.print_status("OK", self.T["course_100_stop"])
                 return (status, score, elapsed)
 
-            if "/results" not in self.page.url.lower():
-                self.navigate_to_results()
-            self._click_exercises_tab()
-            self.page.locator("tbody tr.clickable").first.wait_for(
-                state="visible", timeout=15000
+            self._ensure_results_chapter_and_exercises_ready(
+                force_chapter_click=False,
+                wait_timeout=15000,
             )
-            self._ensure_all_exercises_visible()
-            rows = self.page.locator("tbody tr.clickable").all()
+            rows = self._get_visible_exercise_rows()
             if seen_titles is None:
                 seen_titles = set()
             next_title, next_row_idx = self._next_uncompleted_exercise_entry(
@@ -7149,7 +7512,7 @@ class SpeexxBotCLI:
             return (status, score, elapsed)
 
     def _find_matching_exercise_row(self, title, row_index=None):
-        rows = self.page.locator("tbody tr.clickable").all()
+        rows = self._get_visible_exercise_rows()
         if not rows:
             return None
 
@@ -7190,63 +7553,86 @@ class SpeexxBotCLI:
 
         return None
 
-    def _click_row_safely(self, title, wait_timeout=15000, row_index=None):
+    def _click_row_safely(self, title, wait_timeout=15000, row_index=None, click_inner_cell=False):
         try:
-            if self.page.locator("tbody tr.clickable").count() == 0:
-                self.logger.info("[CLICK] Exercise table empty — recovering Results/Exercises view")
-                if "/results" not in (self.page.url or "").lower():
-                    self.navigate_to_results()
-                else:
-                    self._click_exercises_tab()
-                try:
-                    self.page.locator("tbody tr.clickable").first.wait_for(
-                        state="attached", timeout=min(wait_timeout, 10000)
+            url_low = (self.page.url or "").lower()
+            if "/results" not in url_low or self._count_visible_exercise_rows() == 0:
+                self.logger.info("[CLICK] Exercise table empty or off /results — recovering chapter & Exercises view")
+                self._ensure_results_chapter_and_exercises_ready(
+                    force_chapter_click=False,
+                    wait_timeout=min(wait_timeout, 12000),
+                )
+            else:
+                if self.current_chapter_cid or (
+                    self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
+                ):
+                    self._activate_chapter_on_results(
+                        self.current_chapter_cid,
+                        self.current_chapter_name,
+                        force_click=False,
                     )
-                except Exception:
-                    pass
+                self._click_exercises_tab(force=False)
+                self._ensure_all_exercises_visible()
         except Exception as e:
             self.logger.debug(f"[CLICK] Table recovery check error: {e}")
 
-        self._ensure_all_exercises_visible()
-
         row = self._find_matching_exercise_row(title, row_index=row_index)
         if row is None:
+            self.logger.info(
+                f"[CLICK] '{title}' not in current visible rows — forcing chapter re-select & Show more expansion"
+            )
             try:
-                fallback_loc = self.page.locator("tbody tr.clickable").filter(has_text=title).first
-                fallback_loc.wait_for(state="attached", timeout=min(wait_timeout, 5000))
-                row = fallback_loc
-            except Exception:
-                self.logger.warning(
-                    f"[CLICK] Row not found within {wait_timeout}ms for '{title}' (row_index={row_index})"
+                self._ensure_results_chapter_and_exercises_ready(
+                    force_chapter_click=True,
+                    wait_timeout=min(wait_timeout, 12000),
                 )
-                try:
-                    total = self.page.locator("tbody tr.clickable").count()
-                    self.logger.warning(f"[CLICK] Current tbody tr.clickable count: {total}")
-                except Exception:
-                    pass
-                return False
+            except Exception as e:
+                self.logger.debug(f"[CLICK] Forced chapter refresh error: {e}")
+            row = self._find_matching_exercise_row(title, row_index=row_index)
 
-        time.sleep(0.3)
+        if row is None:
+            vis_total = self._count_visible_exercise_rows()
+            dom_total = 0
+            try:
+                dom_total = self.page.locator("tbody tr.clickable").count()
+            except Exception:
+                pass
+            self.logger.warning(
+                f"[CLICK] Row not found within {wait_timeout}ms for '{title}' "
+                f"(row_index={row_index}, visible_rows={vis_total}, dom_rows={dom_total})"
+            )
+            return False
+
+        time.sleep(0.25)
 
         try:
             row.scroll_into_view_if_needed(timeout=3000)
-            time.sleep(0.3)
+            time.sleep(0.25)
         except Exception as e:
             self.logger.debug(f"[CLICK] scroll_into_view failed: {e}")
             try:
                 row.evaluate("el => el.scrollIntoView({block: 'center'})")
-                time.sleep(0.4)
+                time.sleep(0.3)
             except Exception:
                 pass
 
+        target = row
+        if click_inner_cell:
+            try:
+                inner = row.locator("td a, td").first
+                if inner.count() > 0:
+                    target = inner
+            except Exception:
+                target = row
+
         for mode_label, click_fn in (
-            ("normal", lambda: row.click(timeout=3000)),
-            ("force", lambda: row.click(timeout=3000, force=True)),
-            ("JS", lambda: row.evaluate("el => el.click()")),
+            ("normal", lambda: target.click(timeout=3000)),
+            ("force", lambda: target.click(timeout=3000, force=True)),
+            ("JS", lambda: target.evaluate("el => el.click()")),
         ):
             try:
                 click_fn()
-                self.logger.info(f"[CLICK] '{title}' clicked ({mode_label})")
+                self.logger.info(f"[CLICK] '{title}' clicked ({mode_label}, inner={click_inner_cell})")
                 return True
             except Exception as e:
                 self.logger.debug(f"[CLICK] {mode_label} click failed: {str(e)[:120]}")
@@ -7323,9 +7709,11 @@ class SpeexxBotCLI:
         self._ensure_chapter_db_loaded(announce=True)
 
         try:
-            self._click_exercises_tab()
-            self._ensure_all_exercises_visible()
-            rows = self.page.locator("tbody tr.clickable").all()
+            self._ensure_results_chapter_and_exercises_ready(
+                force_chapter_click=False,
+                wait_timeout=15000,
+            )
+            rows = self._get_visible_exercise_rows()
             first_uncompleted = None
             first_row_idx = None
             seen_cat = {item.get("title") for item in self.chapter_catalog}
@@ -7372,7 +7760,9 @@ class SpeexxBotCLI:
             try:
                 c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
                 if c == "1":
-                    if self.current_chapter_cid and self.current_chapter_name:
+                    if self.current_chapter_cid or (
+                        self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
+                    ):
                         self.select_chapter(self.current_chapter_cid, self.current_chapter_name)
                     else:
                         self.navigate_to_results()

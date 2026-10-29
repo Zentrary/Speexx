@@ -1665,3 +1665,234 @@ def test_english_batch_and_auto_continue_chain_zero_thai_output(cli_bot, capsys,
     thai_chars = [ch for ch in out if "\u0e00" <= ch <= "\u0e7f"]
     assert thai_chars == [], f"Found unexpected Thai output in English CLI mode: {''.join(thai_chars)}"
 
+
+# ==============================================================================
+# 12. Live Speexx /results Hidden Rows (`display: none`), Non-Button `Show more ⌄`,
+#     Chapter Recovery & Reordered 2-Option Exercise Menu
+# ==============================================================================
+
+@pytest.mark.parametrize("more_label,less_label", [
+    ("Show more ⌄", "Show less ⌃"),
+    ("แสดงเพิ่มเติม ⌄", "แสดงน้อยลง ⌃"),
+])
+def test_hidden_display_none_rows_behind_non_button_show_more_and_hidden_show_less_span(
+    cli_bot, more_label, less_label
+):
+    html = f"""
+    <!doctype html><html><body>
+      <div class="level-container active" data-id="101">
+        <div class="level-inside-box active"><span class="level-text">A1</span></div>
+      </div>
+      <div id="results-table-exercises" class="active">Exercises</div>
+      <table><tbody id="ex-tbody"></tbody></table>
+      <div id="custom-more-wrapper" style="cursor: pointer;">
+        <span id="more-span">{more_label}</span>
+        <span id="less-span" style="display: none;">{less_label}</span>
+      </div>
+      <script>
+        const tbody = document.getElementById('ex-tbody');
+        // Pre-attach all 96 rows in DOM (1..6 visible, 7..96 hidden via display:none, row 96 = 'Hello')
+        for (let i = 1; i <= 96; i++) {{
+          const tr = document.createElement('tr');
+          tr.className = 'clickable';
+          if (i > 6) tr.style.display = 'none';
+          const title = i === 1 ? 'One moment please' : (i === 96 ? 'Hello' : ('A1 Exercise ' + i));
+          tr.innerHTML = '<td>' + title + '</td><td>16/09/2026</td><td>2 min</td><td>100</td><td><button>_</button></td>';
+          tbody.appendChild(tr);
+        }}
+        let shown = 6;
+        const wrapper = document.getElementById('custom-more-wrapper');
+        const moreSpan = document.getElementById('more-span');
+        const lessSpan = document.getElementById('less-span');
+        wrapper.addEventListener('click', () => {{
+          const allTr = Array.from(tbody.querySelectorAll('tr.clickable'));
+          if (shown < 96) {{
+            shown = Math.min(96, shown + 30);
+            allTr.forEach((tr, idx) => {{
+              tr.style.display = idx < shown ? '' : 'none';
+            }});
+            if (shown >= 96) {{
+              moreSpan.style.display = 'none';
+              lessSpan.style.display = '';
+            }}
+          }} else {{
+            // Collapse if mistakenly clicked when already expanded!
+            shown = 6;
+            allTr.forEach((tr, idx) => {{
+              tr.style.display = idx < 6 ? '' : 'none';
+            }});
+            moreSpan.style.display = '';
+            lessSpan.style.display = 'none';
+          }}
+        }});
+      </script>
+    </body></html>
+    """
+    cli_bot.page.set_content(html, url="https://portal.speexx.com/articles/10966375/results")
+
+    # Before Show more is clicked: DOM has 96 attached rows, but ONLY 6 are visible!
+    assert cli_bot.page.locator("tbody tr.clickable").count() == 96
+    assert cli_bot._count_visible_exercise_rows() == 6
+    assert len(cli_bot._get_visible_exercise_rows()) == 6
+
+    # Expanding must click the non-button 'Show more ⌄' 3 times until all 96 rows are visible!
+    assert cli_bot._ensure_all_exercises_visible() is True
+    assert cli_bot._count_visible_exercise_rows() == 96
+    vis_rows = cli_bot._get_visible_exercise_rows()
+    assert len(vis_rows) == 96
+    assert cli_bot._inspect_result_row(vis_rows[95], row_index=95)["title"] == "Hello"
+
+    # Calling _ensure_all_exercises_visible() again must NOT click 'Show less ⌃'!
+    assert cli_bot._ensure_all_exercises_visible() is True
+    assert cli_bot._count_visible_exercise_rows() == 96
+
+
+def test_select_chapter_switches_live_dom_ignores_db_catalog_and_recovers_drifted_chapter(
+    cli_bot, monkeypatch, capsys
+):
+    # Pre-seed answers_A1.json with fake DB-only catalog entries to prove CLI NEVER pulls list from DB!
+    fake_db_path = os.path.join(cli_bot.reports_folder, "answers_A1.json")
+    with open(fake_db_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schema_version": 2,
+                "chapter": {
+                    "name": "A1",
+                    "cid": "101",
+                    "catalog": [
+                        {"title": "FAKE_DB_ONLY_EXERCISE_999", "pages_total": 3},
+                    ],
+                },
+                "exercises": [],
+            },
+            f,
+        )
+
+    results_spa_html = """
+    <!doctype html><html><body>
+      <div class="levels">
+        <div class="level-container" data-id="101" id="lvl-a1">
+          <div class="level-inside-box"><span class="level-text">A1</span></div>
+        </div>
+        <div class="level-container active" data-id="505" id="lvl-b2">
+          <div class="level-inside-box active"><span class="level-text">B2</span></div>
+        </div>
+      </div>
+      <div id="results-table-exercises" class="active">Exercises</div>
+      <table><tbody id="spa-tbody"></tbody></table>
+      <div id="spa-more" class="show-more" style="display:none; cursor:pointer;">
+        <span>Show more ⌄</span>
+      </div>
+      <script>
+        window.__activeChapter = 'B2';
+        window.__clickedExercise = null;
+        const tbody = document.getElementById('spa-tbody');
+        const moreEl = document.getElementById('spa-more');
+
+        function renderChapter(ch) {
+          window.__activeChapter = ch;
+          document.getElementById('lvl-a1').classList.toggle('active', ch === 'A1');
+          document.querySelector('#lvl-a1 .level-inside-box').classList.toggle('active', ch === 'A1');
+          document.getElementById('lvl-b2').classList.toggle('active', ch === 'B2');
+          document.querySelector('#lvl-b2 .level-inside-box').classList.toggle('active', ch === 'B2');
+
+          tbody.innerHTML = '';
+          if (ch === 'B2') {
+            moreEl.style.display = 'none';
+            ['Industrial chemicals in practice', 'Data tsunami in telecom', 'UI/UX design'].forEach(t => {
+              const tr = document.createElement('tr');
+              tr.className = 'clickable';
+              tr.innerHTML = '<td>' + t + '</td><td>28/10/2026</td><td>5 min</td><td>90</td><td><button>_</button></td>';
+              tr.addEventListener('click', () => { window.__clickedExercise = ch + ':' + t; });
+              tbody.appendChild(tr);
+            });
+          } else {
+            const titles = ['One moment please', 'Is Mary there?', 'On the phone', 'Can you speak Spanish?', "I'm fine", 'Hello'];
+            titles.forEach((t, idx) => {
+              const tr = document.createElement('tr');
+              tr.className = 'clickable';
+              if (idx >= 3) tr.style.display = 'none';
+              tr.innerHTML = '<td>' + t + '</td><td>16/09/2026</td><td>2 min</td><td>100</td><td><button>_</button></td>';
+              tr.addEventListener('click', () => { window.__clickedExercise = ch + ':' + t; });
+              tbody.appendChild(tr);
+            });
+            moreEl.style.display = '';
+          }
+        }
+
+        window.__renderChapter = renderChapter;
+        document.querySelector('#lvl-a1 .level-inside-box').addEventListener('click', () => renderChapter('A1'));
+        document.querySelector('#lvl-b2 .level-inside-box').addEventListener('click', () => renderChapter('B2'));
+        moreEl.addEventListener('click', () => {
+          tbody.querySelectorAll('tr.clickable').forEach(tr => { tr.style.display = ''; });
+          moreEl.style.display = 'none';
+        });
+
+        renderChapter('B2');
+      </script>
+    </body></html>
+    """
+    cli_bot.page.set_content(results_spa_html, url="https://portal.speexx.com/articles/10966375/results")
+    assert cli_bot.page.evaluate("() => window.__activeChapter") == "B2"
+
+    # User selects chapter [1] (A1), then presses [0] in fetch_exercises to inspect printed table
+    inputs = iter(["1", "0"])
+    monkeypatch.setattr(cli_bot, "_input", lambda prompt="": next(inputs, "0"))
+    cli_bot.fetch_and_select_chapter()
+
+    out = capsys.readouterr().out
+    assert cli_bot.current_chapter_name == "A1"
+    assert cli_bot.page.evaluate("() => window.__activeChapter") == "A1"
+    assert "One moment please" in out
+    assert "Hello" in out
+    assert "FAKE_DB_ONLY_EXERCISE_999" not in out
+    assert "Industrial chemicals in practice" not in out
+
+    # Now simulate Speexx drifting back to B2 while user was in CLI menu, then clicking 'Hello' (row_index=5)!
+    cli_bot.page.evaluate("() => window.__renderChapter('B2')")
+    assert cli_bot.page.evaluate("() => window.__activeChapter") == "B2"
+
+    assert cli_bot._click_row_safely("Hello", row_index=5) is True
+    assert cli_bot.page.evaluate("() => window.__activeChapter") == "A1"
+    assert cli_bot.page.evaluate("() => window.__clickedExercise") == "A1:Hello"
+
+
+@pytest.mark.parametrize("lang", ["th", "en"])
+def test_open_exercise_menu_reordered_two_options_th_and_en(cli_bot, monkeypatch, capsys, lang):
+    cli_bot.lang = lang
+    cli_bot.T = TRANSLATIONS[lang]
+
+    # Just view / click_exercise must be completely removed
+    assert not hasattr(cli_bot, "click_exercise")
+    assert "opt_view" not in cli_bot.T
+    assert "opt_auto_solve" not in cli_bot.T
+
+    calls = []
+    monkeypatch.setattr(
+        cli_bot,
+        "start_new_learning_path",
+        lambda title, row_index=None: calls.append(("continuous", title, row_index)),
+    )
+    monkeypatch.setattr(
+        cli_bot,
+        "dump_all_exercise_pages",
+        lambda title, row_index=None: calls.append(("dump", title, row_index)),
+    )
+
+    # Option [1] -> Continuous New Exercises
+    monkeypatch.setattr(cli_bot, "_input", lambda prompt="": "1")
+    cli_bot.open_exercise_menu("Hello", row_index=95)
+    out1 = capsys.readouterr().out
+    assert f"[1]" in out1 and cli_bot.T["opt_new_learning_path"] in out1
+    assert f"[2]" in out1 and cli_bot.T["opt_dump"] in out1
+    assert "Just view" not in out1
+    assert "เปิดดูเฉยๆ" not in out1
+    assert "Auto Solve" not in out1
+    assert calls[-1] == ("continuous", "Hello", 95)
+
+    # Option [2] -> Dump All Pages
+    monkeypatch.setattr(cli_bot, "_input", lambda prompt="": "2")
+    cli_bot.open_exercise_menu("Hello", row_index=95)
+    assert calls[-1] == ("dump", "Hello", 95)
+
+
