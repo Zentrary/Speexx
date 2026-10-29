@@ -365,6 +365,8 @@ class BaseSolver:
                     let prio = 0;
 
                     if (targetKind === 'correction') {
+                        // Never click an already-graded grey Correction button (`btn-default visited`)!
+                        if (/\\b(visited|disabled|btn-default|inactive)\\b/.test(cls)) continue;
                         if (/\\bcorrect\\b/.test(cls) && cls.includes('action-exercise-button')) prio = 100;
                         else if (/\\bcorrect\\b/.test(cls)) prio = 90;
                         else if (/(\\bcorrection\\b|\\bcheck\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(meta) || txt === 'ตรวจ') prio = 75;
@@ -412,17 +414,23 @@ class BaseSolver:
                         const r = el.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
                     };
+                    // Wait while Speexx grading spinner (spin.js) is visible on the exercise page
+                    for (const sp of document.querySelectorAll('.spinner, [us-spinner] .spinner, [class*="loading-spinner"]')) {
+                        if (sp.closest('.video-js, .player.hidden')) continue;
+                        if (isVis(sp)) return false;
+                    }
                     if (isVis(document.querySelector('.circliful-and-results')) || isVis(document.querySelector('.exercise-result-container'))) {
                         return true;
                     }
                     for (const b of document.querySelectorAll("button, [role='button']")) {
-                        if (b.disabled || !isVis(b)) continue;
+                        if (b.disabled || b.getAttribute('aria-disabled') === 'true' || !isVis(b)) continue;
                         if (b.closest('.circliful-and-results, .modal, .modal-dialog')) continue;
                         const cls = (b.className || '').toString().toLowerCase();
-                        if (cls.includes('disabled')) continue;
+                        // In Speexx, an already-graded Correction button gets `btn-default visited` (not `disabled`)!
+                        if (/\\b(visited|disabled|btn-default|inactive)\\b/.test(cls)) continue;
                         const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
                         if (/\\b(correction|correct)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(txt)) {
-                            // Correction button is still enabled -> grading has NOT completed yet (ignore stale 0/100 badge!)
+                            // Active orange Correction button is still enabled -> grading has NOT completed yet!
                             return false;
                         }
                     }
@@ -431,7 +439,7 @@ class BaseSolver:
                         if (!isVis(b) || b.disabled) continue;
                         const cls = (b.className || '').toString().toLowerCase();
                         const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
-                        if (/\\b(solution|repeat|next)\\b/.test(cls)) return true;
+                        if (/\\b(solution|repeat|next|nxt-exercise)\\b/.test(cls)) return true;
                         if (/(solution|เฉลย|repeat|try again|ทำซ้ำ|continue learning|เรียนรู้ต่อ|\\bnext\\b|ถัดไป)/.test(txt)) return true;
                     }
                     const graded = document.querySelector(
@@ -443,8 +451,90 @@ class BaseSolver:
         except Exception:
             return False
 
+    def is_locked_perfect_score(self):
+        """Return True if page is already graded 100/100 and Speexx renders NO Repeat button to reset it."""
+        try:
+            score = self.get_result_score(wait_for_score=False)
+            if score < 100:
+                return False
+            has_repeat = bool(
+                self.page.evaluate(
+                    """
+                    () => {
+                        const isVis = (el) => {
+                            if (!el || el.disabled) return false;
+                            if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
+                            const st = window.getComputedStyle(el);
+                            if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0;
+                        };
+                        for (const b of document.querySelectorAll("button, [role='button']")) {
+                            if (!isVis(b)) continue;
+                            const cls = (b.className || '').toString().toLowerCase();
+                            if (/\\b(visited|disabled)\\b/.test(cls)) continue;
+                            const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                            if (/\\brepeat\\b/.test(cls) || /(\\brepeat\\b|try again|\\bretry\\b|ทำซ้ำ|ลองอีกครั้ง|ลองใหม่)/.test(txt)) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    """
+                )
+            )
+            return not has_repeat
+        except Exception:
+            return False
+
     def already_passed(self):
         if getattr(self, 'force_solve', False):
+            # If Speexx locked this page at 100/100 with NO Repeat button (only visited Correction + Next),
+            # there is no Repeat or Solution button on this page — record its 100/100 answers and advance!
+            if self.is_locked_perfect_score():
+                self.verify_step(
+                    "ตรวจสอบสถานะหน้าแบบฝึกหัด",
+                    True,
+                    "ได้คะแนน 100/100 อยู่แล้ว พร้อมไปหน้าถัดไป",
+                )
+                return True
+            # If page was previously graded (< 100) and has an active Repeat button, reset it first so it's editable
+            try:
+                needs_initial_reset = bool(
+                    self.page.evaluate(
+                        """
+                        () => {
+                            const isVis = (el) => {
+                                if (!el || el.disabled) return false;
+                                if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
+                                const st = window.getComputedStyle(el);
+                                if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0;
+                            };
+                            let corrVisited = false;
+                            let repeatVis = false;
+                            for (const b of document.querySelectorAll("button, [role='button']")) {
+                                if (!isVis(b)) continue;
+                                const cls = (b.className || '').toString().toLowerCase();
+                                const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                                if (/\\b(correction|correct)\\b/.test(cls) && /\\b(visited|btn-default)\\b/.test(cls)) {
+                                    corrVisited = true;
+                                }
+                                if (!/\\b(visited|disabled)\\b/.test(cls) &&
+                                    (/\\brepeat\\b/.test(cls) || /(\\brepeat\\b|try again|\\bretry\\b|ทำซ้ำ|ลองอีกครั้ง)/.test(txt))) {
+                                    repeatVis = true;
+                                }
+                            }
+                            return corrVisited && repeatVis;
+                        }
+                        """
+                    )
+                )
+                if needs_initial_reset:
+                    self.click_repeat()
+            except Exception:
+                pass
             return False
         try:
             score = self.get_result_score(wait_for_score=False)
@@ -455,29 +545,65 @@ class BaseSolver:
     def click_correction(self, settle=ACTION_SETTLE_SECONDS):
         self._handle_audio_setup_modal()
         selectors = [
-            "button.action-exercise-button.correct",
-            "button.correct",
-            "button[aria-label*='Correction' i]",
-            "button[aria-label*='Check' i]",
-            "button[aria-label*='ตรวจ']",
-            "button:has-text('Check')",
-            "button:has-text('Correction')",
-            "button:has-text('ตรวจคำตอบ')",
-            "button:has-text('ตรวจ')",
+            "button.action-exercise-button.correct:not(.visited):not(.btn-default)",
+            "button.correct:not(.visited):not(.btn-default)",
+            "button[aria-label*='Correction' i]:not(.visited):not(.btn-default)",
+            "button[aria-label*='Check' i]:not(.visited):not(.btn-default)",
+            "button[aria-label*='ตรวจ']:not(.visited):not(.btn-default)",
+            "button:has-text('Check'):not(.visited):not(.btn-default)",
+            "button:has-text('Correction'):not(.visited):not(.btn-default)",
+            "button:has-text('ตรวจคำตอบ'):not(.visited):not(.btn-default)",
+            "button:has-text('ตรวจ'):not(.visited):not(.btn-default)",
         ]
         try:
+            # Fast check: if page is ALREADY graded (e.g. Correction is `btn-default visited` and score badge is visible),
+            # do NOT re-click the grey visited Correction button (which triggers a pointless re-check spinner)!
+            if self._is_post_correction_ready():
+                has_active_corr = bool(
+                    self.page.evaluate(
+                        """
+                        () => {
+                            const isVis = (el) => {
+                                if (!el || el.disabled) return false;
+                                if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
+                                const st = window.getComputedStyle(el);
+                                if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0;
+                            };
+                            for (const b of document.querySelectorAll("button, [role='button']")) {
+                                if (!isVis(b)) continue;
+                                const cls = (b.className || '').toString().toLowerCase();
+                                if (/\\b(visited|disabled|btn-default|inactive)\\b/.test(cls)) continue;
+                                const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                                if (/\\b(correction|correct)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(txt)) {
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }
+                        """
+                    )
+                )
+                if not has_active_corr:
+                    self.verify_step("กดปุ่มตรวจสอบ [Correction]", True, "ตรวจคำตอบแล้ว")
+                    return True
+
             clicked = False
-            fast_btn = self._locate_action_button("correction", wait_timeout=2.2)
+            fast_btn = self._locate_action_button("correction", wait_timeout=1.8)
             if fast_btn is not None:
                 clicked = self._safe_click(fast_btn, timeout=3500, description="correction")
             if not clicked:
-                clicked = self._click_first_matching(selectors, description="correction", vis_timeout=800)
+                clicked = self._click_first_matching(selectors, description="correction", vis_timeout=600)
 
             if not clicked:
+                if self._is_post_correction_ready():
+                    self.verify_step("กดปุ่มตรวจสอบ [Correction]", True, "ตรวจคำตอบแล้ว")
+                    return True
                 self.verify_step("กดปุ่มตรวจสอบ [Correction]", False, "ไม่พบปุ่มตรวจสอบ")
                 return False
 
-            deadline = time.time() + 4.0
+            deadline = time.time() + 5.0
             ready = False
             while time.time() < deadline:
                 if self._is_post_correction_ready():
@@ -486,17 +612,17 @@ class BaseSolver:
                 time.sleep(0.07)
 
             if not ready:
-                retry_btn = self._locate_action_button("correction", wait_timeout=0.6)
+                retry_btn = self._locate_action_button("correction", wait_timeout=0.5)
                 if retry_btn is not None:
                     self._safe_click(retry_btn, timeout=2500, description="correction-retry")
-                retry_deadline = time.time() + max(1.2, settle + 1.0)
+                retry_deadline = time.time() + max(1.5, settle + 1.2)
                 while time.time() < retry_deadline:
                     if self._is_post_correction_ready():
                         ready = True
                         break
                     time.sleep(0.07)
 
-            time.sleep(0.14)
+            time.sleep(0.12)
             self.verify_step("กดปุ่มตรวจสอบ [Correction]", True, "ตรวจคำตอบแล้ว" if ready else "คลิกแล้ว")
             return True
         except Exception as e:
@@ -604,7 +730,7 @@ class BaseSolver:
                 clicked = self._click_first_matching(selectors, description="repeat", vis_timeout=400)
 
             if not clicked:
-                # Check if Repeat is absent because the page is ALREADY editable (Correction enabled)
+                # Check if Repeat is absent because the page is ALREADY editable (active non-visited Correction)
                 # OR because the page ALREADY scored >= PASS_LINE (Speexx hides Repeat on 100/100)!
                 already_ok = bool(
                     self.page.evaluate(
@@ -618,10 +744,10 @@ class BaseSolver:
                                 return r.width > 0 && r.height > 0;
                             };
                             for (const b of document.querySelectorAll("button, [role='button']")) {
-                                if (b.disabled || !isVis(b)) continue;
+                                if (b.disabled || b.getAttribute('aria-disabled') === 'true' || !isVis(b)) continue;
                                 if (b.closest('.circliful-and-results, .modal, .modal-dialog')) continue;
                                 const cls = (b.className || '').toString().toLowerCase();
-                                if (cls.includes('disabled')) continue;
+                                if (/\\b(visited|disabled|btn-default|inactive)\\b/.test(cls)) continue;
                                 const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
                                 if (/\\b(correction|correct|start-exercise)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ|\\bstart\\b|เริ่มต้น)/.test(txt)) {
                                     return true;
@@ -651,7 +777,7 @@ class BaseSolver:
                 """
                 () => {
                     const isVis = (el) => {
-                        if (!el || el.disabled) return false;
+                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
                         if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
                         const st = window.getComputedStyle(el);
                         if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
@@ -665,6 +791,8 @@ class BaseSolver:
                     for (const b of document.querySelectorAll("button, [role='button']")) {
                         if (!isVis(b)) continue;
                         const cls = (b.className || '').toString().toLowerCase();
+                        // Must wait until Correction loses `visited` / `btn-default` and becomes active `btn-primary`!
+                        if (/\\b(visited|disabled|btn-default|inactive)\\b/.test(cls)) continue;
                         const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
                         if (/\\b(correction|correct|start-exercise)\\b/.test(cls)) return true;
                         if (/(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ|\\bstart\\b|เริ่มต้น)/.test(txt)) return true;
@@ -768,15 +896,22 @@ class BaseSolver:
                         return r.width > 0 && r.height > 0;
                     };
 
-                    // If Completion Modal is NOT open and Correction button is still enabled,
+                    // Wait if Speexx grading spinner (spin.js) is actively spinning
+                    for (const sp of document.querySelectorAll('.spinner, [us-spinner] .spinner, [class*="loading-spinner"]')) {
+                        if (sp.closest('.video-js, .player.hidden')) continue;
+                        if (isVis(sp)) return -1;
+                    }
+
+                    // If Completion Modal is NOT open and an ACTIVE (non-visited, non-btn-default) Correction button is visible,
                     // any visible .result-badge-text is a STALE score from before Repeat!
+                    // Once graded, Speexx sets class `btn btn-default visited action-exercise-button correct` on Correction!
                     const modalOpen = isVis(document.querySelector('.circliful-and-results')) || isVis(document.querySelector('.exercise-result-container'));
                     if (!modalOpen) {
                         for (const b of document.querySelectorAll("button, [role='button']")) {
-                            if (b.disabled || !isVis(b)) continue;
+                            if (b.disabled || b.getAttribute('aria-disabled') === 'true' || !isVis(b)) continue;
                             if (b.closest('.circliful-and-results, .modal, .modal-dialog')) continue;
                             const cls = (b.className || '').toString().toLowerCase();
-                            if (cls.includes('disabled')) continue;
+                            if (/\\b(visited|disabled|btn-default|inactive)\\b/.test(cls)) continue;
                             const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
                             if (/\\b(correction|correct)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(txt)) {
                                 return -1;

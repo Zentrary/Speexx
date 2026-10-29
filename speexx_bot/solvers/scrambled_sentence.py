@@ -126,6 +126,10 @@ class ScrambledSentenceSolver(BaseSolver):
             target_sentences = None
 
         self.click_correction()
+        if self.get_result_score(wait_for_score=False) >= 100:
+            self.extract_current_state_answers(verified=True)
+            self.verify_step("ตรวจคะแนนเรียงประโยค", True, "ได้คะแนน 100/100")
+            return True
         if self.click_solution():
             target_sentences = self.extract_solution_sentences()
 
