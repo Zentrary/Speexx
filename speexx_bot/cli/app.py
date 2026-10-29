@@ -17,6 +17,7 @@ from .exercise_list_mixin import ExerciseListMixin
 from .modal_page_mixin import ModalAndPageMixin
 from .results_nav_mixin import ResultsNavigationMixin
 from .runner_mixin import ExerciseRunnerMixin
+from .speed_settings_mixin import SpeedSettingsMixin
 
 
 class SpeexxBotCLI(
@@ -27,6 +28,7 @@ class SpeexxBotCLI(
     ExerciseListMixin,
     ModalAndPageMixin,
     ExerciseRunnerMixin,
+    SpeedSettingsMixin,
 ):
     MAX_NEW_EXERCISE_CHAIN = 300
     DEFAULT_CHAPTER_NAME = "General"
@@ -38,6 +40,9 @@ class SpeexxBotCLI(
         self.reports_folder = "reports"
         self.profiles_folder = "chrome_profiles"
         self.accounts_file = os.path.join(self.config_folder, "accounts.json")
+        # Self-healing & Anti-flaky engines (lazy init)
+        self._healer = None
+        self._flaky = None
 
         self.current_chapter_cid = None
         self.current_chapter_name = ""
@@ -294,6 +299,26 @@ class SpeexxBotCLI(
                 self.print_status("ERROR", f"Error: {str(e)}")
                 self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
 
+    @property
+    def healer(self):
+        if self._healer is None:
+            try:
+                from ..self_healing import SelfHealingEngine
+                self._healer = SelfHealingEngine(self)
+            except Exception:
+                self._healer = None
+        return self._healer
+
+    @property
+    def flaky(self):
+        if self._flaky is None:
+            try:
+                from ..anti_flaky import AntiFlakyDetector
+                self._flaky = AntiFlakyDetector(self)
+            except Exception:
+                self._flaky = None
+        return self._flaky
+
     def dashboard_menu(self):
         while True:
             self.print_header()
@@ -301,8 +326,10 @@ class SpeexxBotCLI(
             print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} {self.T['opt_select_chapter']}")
             print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} {self.T['opt_results']}")
             print(f"  {Fore.WHITE}[3]{Style.RESET_ALL} {self.T['opt_search_answer']}")
-            print(f"  {Fore.WHITE}[4]{Style.RESET_ALL} {self.T['opt_logout']}")
-            print(f"  {Fore.WHITE}[5]{Style.RESET_ALL} {self.T['opt_exit']}")
+            print(f"  {Fore.WHITE}[4]{Style.RESET_ALL} {self.T.get('opt_speed_settings', 'ตั้งค่าความเร็วแบบละเอียด')}")
+            print(f"  {Fore.WHITE}[5]{Style.RESET_ALL} {self.T.get('opt_pron_settings', 'ตั้งค่าฝึกออกเสียง')}")
+            print(f"  {Fore.WHITE}[6]{Style.RESET_ALL} {self.T['opt_logout']}")
+            print(f"  {Fore.WHITE}[7]{Style.RESET_ALL} {self.T['opt_exit']}")
             try:
                 c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
                 if c == "":
@@ -314,10 +341,14 @@ class SpeexxBotCLI(
                 elif c == "3":
                     self.search_answer_interactive()
                 elif c == "4":
+                    self.speed_settings_menu()
+                elif c == "5":
+                    self.pronunciation_settings_menu()
+                elif c == "6":
                     self.print_status("INFO", "Logging out...")
                     self._cleanup_browser()
                     return
-                elif c == "5":
+                elif c == "7":
                     self.shutdown()
                 else:
                     self.print_status("ERROR", self.T['invalid_choice'])
@@ -327,6 +358,44 @@ class SpeexxBotCLI(
             except Exception as e:
                 self.print_status("ERROR", f"Error: {str(e)}")
                 self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+
+    def pronunciation_settings_menu(self):
+        self.print_header()
+        print(f"  {Fore.CYAN}--- {self.T.get('pron_menu_title', 'ตั้งค่าฝึกออกเสียง')} ---{Style.RESET_ALL}\n")
+        try:
+            from ..speed_config import get, set_value, get_default
+        except Exception:
+            self.print_status("ERROR", "โหลด config ไม่ได้")
+            self._input(f"  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+            return
+        cur = get("PRON_RECORD_DURATION")
+        print(f"  เวลาอัดเสียงปัจจุบัน: {Fore.CYAN}{cur}s{Style.RESET_ALL} (default {get_default('PRON_RECORD_DURATION')}s)")
+        print(f"  {Fore.YELLOW}คำแนะนำ: 6-10 วินาทีสำหรับประโยคสั้น, 10-15 วินาทีสำหรับประโยคยาว{Style.RESET_ALL}\n")
+        print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} ตั้งเวลาอัด (วินาที)")
+        print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} สลับโหมดปิดเสียง (mute) — ตอนนี้: {'เปิด' if self._is_muted() else 'ปิด'}")
+        print(f"  {Fore.WHITE}[0]{Style.RESET_ALL} กลับ")
+        try:
+            c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
+            if c == "1":
+                nv = self._input(f"  {Fore.CYAN}[>] ใส่เวลาอัดใหม่ (วินาที): {Style.RESET_ALL}").strip()
+                try:
+                    v = float(nv)
+                    if 3 <= v <= 20:
+                        set_value("PRON_RECORD_DURATION", v)
+                        self.print_status("OK", f"ตั้งเวลาอัดเป็น {v}s แล้ว")
+                    else:
+                        self.print_status("ERROR", "ต้องอยู่ระหว่าง 3-20 วินาที")
+                except ValueError:
+                    self.print_status("ERROR", "ต้องเป็นตัวเลข")
+                self._input(f"  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+            elif c == "2":
+                self.print_status("INFO", "โหมดปิดเสียง (mute) เปิดอยู่เสมอ — ไม่มีการซ้อนเว็บ/แจ้งเตือน")
+                self._input(f"  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+        except (EOFError, KeyboardInterrupt):
+            return
+
+    def _is_muted(self):
+        return True
 
     def main_menu(self):
         self.select_language()

@@ -3,6 +3,7 @@
 import re
 import time
 
+from ..speed_config import get as _sp
 from ..ui_utils import Fore, Style
 
 

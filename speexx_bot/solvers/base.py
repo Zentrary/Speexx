@@ -9,6 +9,18 @@ from difflib import SequenceMatcher
 from ..constants import ACTION_SETTLE_SECONDS, FAST_ACTION_SETTLE_SECONDS
 from ..ui_utils import Fore, Style
 
+try:
+    from ..speed_config import get as _speed
+except Exception:
+    _speed = lambda k, d=None: d
+
+def _sp(key, fallback):
+    try:
+        v = _speed(key)
+        return float(v) if v is not None else fallback
+    except Exception:
+        return fallback
+
 
 class BaseSolver:
     PASS_LINE = 51
@@ -658,7 +670,7 @@ class BaseSolver:
                 self.verify_step("กดปุ่มตรวจสอบ [Correction]", False, "ไม่พบปุ่มตรวจสอบ")
                 return False
 
-            deadline = time.time() + 6.5
+            deadline = time.time() + _sp("CLICK_CORRECTION_WAIT", 6.5)
             ready = False
             while time.time() < deadline:
                 if self._is_post_correction_ready():
@@ -670,7 +682,7 @@ class BaseSolver:
                 retry_btn = self._locate_action_button("correction", wait_timeout=0.6)
                 if retry_btn is not None:
                     self._safe_click(retry_btn, timeout=2800, description="correction-retry")
-                retry_deadline = time.time() + max(2.0, settle + 1.5)
+                retry_deadline = time.time() + max(_sp("CLICK_CORRECTION_RETRY_WAIT", 2.0), settle + 1.5)
                 while time.time() < retry_deadline:
                     if self._is_post_correction_ready():
                         ready = True
@@ -702,7 +714,7 @@ class BaseSolver:
                 clicked = self._click_first_matching(selectors, description="next", vis_timeout=500)
             if clicked:
                 self.step("Clicked [Next]")
-                time.sleep(FAST_ACTION_SETTLE_SECONDS)
+                time.sleep(_sp("CLICK_NEXT_SETTLE", FAST_ACTION_SETTLE_SECONDS))
                 return True
         except Exception as e:
             self.logger.error(f"Failed Next: {str(e)}")
@@ -858,7 +870,7 @@ class BaseSolver:
                 timeout=max(2.0, settle + 2.2),
                 interval=0.05,
             )
-            time.sleep(0.45)
+            time.sleep(_sp("CLICK_REPEAT_SETTLE", 0.45))
             if self.has_start_button():
                 self.click_start()
             self.verify_step("กดปุ่มทำซ้ำ [Repeat]", True, "รีเซ็ตหน้าพร้อมกรอกคำตอบแล้ว" if reset_ok else "คลิกแล้ว")
@@ -1073,7 +1085,7 @@ class BaseSolver:
 
     def wait_for_page_ready(self):
         try:
-            self.page.wait_for_selector(".exercise, video", state="visible", timeout=12000)
+            self.page.wait_for_selector(".exercise, video", state="visible", timeout=int(_sp("PAGE_READY_TIMEOUT", 12.0)*1000))
             self._wait_until_js(
                 """
                 () => Boolean(

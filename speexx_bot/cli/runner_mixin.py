@@ -5,6 +5,16 @@ import time
 from ..constants import UNSUPPORTED_TYPES
 from ..solvers import ExerciseEngine
 from ..ui_utils import Fore, Style
+try:
+    from ..speed_config import get as _speed
+except Exception:
+    _speed = lambda k, d=None: d
+def _sp(k, d):
+    try:
+        v = _speed(k)
+        return float(v) if v is not None else d
+    except Exception:
+        return d
 
 
 class ExerciseRunnerMixin:
@@ -91,7 +101,7 @@ class ExerciseRunnerMixin:
             if idx > 1:
                 try:
                     self.navigate_to_results()
-                    time.sleep(1.5)
+                    time.sleep(_sp("RUNNER_BATCH_SLEEP", 1.5))
                 except Exception:
                     pass
 
@@ -191,8 +201,8 @@ class ExerciseRunnerMixin:
                                 )
                             except Exception:
                                 pass
-                self.wait_for_exercise_content_ready(timeout=8.0)
-                time.sleep(0.4)
+                self.wait_for_exercise_content_ready(timeout=_sp("WAIT_EXERCISE_CONTENT_READY_TIMEOUT", 8.0))
+                time.sleep(_sp("WAIT_EXERCISE_CONTENT_READY_SETTLE", 0.4))
 
             self._ensure_chapter_db_loaded(announce=False)
 
@@ -213,20 +223,20 @@ class ExerciseRunnerMixin:
                         chain_seen_titles.add(f"title:{norm_resolved}")
 
             if total_pages is None:
-                total_pages = self.get_total_exercises(retries=3, wait_seconds=0.6)
+                total_pages = self.get_total_exercises(retries=int(_sp("GET_TOTAL_RETRIES", 3)), wait_seconds=_sp("GET_TOTAL_WAIT_SECONDS", 0.6))
 
             if total_pages == 0:
                 if self._is_on_results_page():
                     self.logger.warning("[TOTAL] Still on /results (total=0), re-selecting chapter & clicking row...")
                     if self._click_row_safely(title, row_index=row_index, click_inner_cell=True):
                         time.sleep(0.8)
-                        total_pages = self.get_total_exercises(retries=3, wait_seconds=0.6)
+                        total_pages = self.get_total_exercises(retries=int(_sp("GET_TOTAL_RETRIES", 3)), wait_seconds=_sp("GET_TOTAL_WAIT_SECONDS", 0.6))
                 else:
                     self.logger.warning("[TOTAL] First attempt = 0, retrying with reload...")
                     try:
                         self.page.reload(wait_until="domcontentloaded", timeout=15000)
                         time.sleep(0.8)
-                        total_pages = self.get_total_exercises(retries=3, wait_seconds=0.6)
+                        total_pages = self.get_total_exercises(retries=int(_sp("GET_TOTAL_RETRIES", 3)), wait_seconds=_sp("GET_TOTAL_WAIT_SECONDS", 0.6))
                     except Exception as e:
                         self.logger.error(f"[TOTAL] Reload failed: {e}")
 
@@ -315,7 +325,7 @@ class ExerciseRunnerMixin:
                     self.wait_for_exercise_content_ready(timeout=8.0)
                     time.sleep(0.5)
 
-                et = engine.detect_type(wait_timeout=7.5)
+                et = engine.detect_type(wait_timeout=_sp("DETECT_TYPE_TIMEOUT", 7.5))
                 if et == "unknown" and self.detect_completion_modal() and not effective_force:
                     early_modal_completed = True
                     break
@@ -395,7 +405,7 @@ class ExerciseRunnerMixin:
                             extra={"error": str(e)},
                         )
                     if vid_res == "RE_DETECT":
-                        et = engine.detect_type(wait_timeout=6.0)
+                        et = engine.detect_type(wait_timeout=_sp("DETECT_TYPE_RECHECK_TIMEOUT", 6.0))
                         self.print_status("PAGE", f"{self.T['page']} {i}/{total_pages} | {self.T['type']}: {et}")
                         solver = engine.get_solver(
                             et,
@@ -488,6 +498,16 @@ class ExerciseRunnerMixin:
                         success = solver.solve()
                     except Exception as e:
                         self.print_status("ERROR", f"Solver error: {str(e)}")
+                        # Self-healing: try to recover from exception
+                        try:
+                            if self.healer and self.healer.handle_solver_exception(title, i, et, type(solver).__name__, e):
+                                self.healer.attempt_heal(title, i, et, type(solver).__name__, error_reason="exception", extra={"error": str(e)[:300]})
+                                retries += 1
+                                if retries < max_retries:
+                                    solver.start_timer()
+                                    continue
+                        except Exception:
+                            pass
                         self.capture_web_error(
                             "solver_exception",
                             exercise_title=title,
@@ -500,6 +520,23 @@ class ExerciseRunnerMixin:
                         success = False
 
                     elapsed = solver.stop_timer() if solver.start_time else "N/A"
+                    # Anti-flaky: detect fake fast 100/100
+                    try:
+                        if self.flaky and success:
+                            if self.flaky.should_force_retry(title, i, page_pass_line if success else 0, elapsed):
+                                self.logger.warning(f"[ANTI-FLAKY] ผลลัพธ์หน้า {i} น่าสงสัย — ลองใหม่แบบละเอียด")
+                                # Force extra verification with longer wait
+                                time.sleep(_sp("GET_RESULT_SCORE_WAIT", 1.0))
+                                re_score = solver.get_result_score(wait_for_score=True)
+                                if re_score < page_pass_line:
+                                    self.print_status("WAIT", f"Anti-flaky ตรวจพบ fake pass — คะแนนจริง {re_score} < {page_pass_line} → ทำใหม่")
+                                    success = False
+                                    score = re_score
+                                else:
+                                    success = True
+                                    score = re_score
+                    except Exception:
+                        pass
                     # If Speexx immediately popped up the completion modal upon passing this page:
                     if self.detect_completion_modal():
                         info_now = self.extract_completion_info()
@@ -516,12 +553,27 @@ class ExerciseRunnerMixin:
 
                     if score >= page_pass_line:
                         success = True
+                        # Final anti-flaky check on success
+                        try:
+                            if self.flaky:
+                                is_sus, reason = self.flaky.check_result(title, i, score, elapsed, et)
+                                if is_sus:
+                                    self.logger.warning(f"[ANTI-FLAKY] {reason}")
+                        except Exception:
+                            pass
                         break
                     else:
                         retries += 1
                         if retries < max_retries:
                             self.print_status("WAIT", self.T['retrying'].format(retries, max_retries))
-                            self._reset_exercise_page()
+                            # Self-healing retry with backoff
+                            try:
+                                if self.healer:
+                                    self.healer.attempt_heal(title, i, et, type(solver).__name__, error_reason=f"low_score_{best_score}", extra={"best_score": best_score})
+                                else:
+                                    self._reset_exercise_page()
+                            except Exception:
+                                self._reset_exercise_page()
                             solver.start_timer()
                         else:
                             self.print_status("WAIT", f"{self.T['max_retries']} (Score: {best_score})")
@@ -741,8 +793,8 @@ class ExerciseRunnerMixin:
                                 chain_direction=chain_direction,
                             )
 
-                        self.wait_for_exercise_content_ready(timeout=8.5)
-                        time.sleep(0.6)
+                        self.wait_for_exercise_content_ready(timeout=_sp("WAIT_EXERCISE_CONTENT_READY_TIMEOUT", 8.5))
+                        time.sleep(_sp("CONTINUE_SETTLE", 0.6))
 
                         new_total = self.get_total_exercises(
                             retries=4,

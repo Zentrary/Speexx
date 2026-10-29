@@ -309,6 +309,25 @@ class AccountsBrowserMixin:
             self._attach_web_diagnostics(self.page)
             self.print_status("OK", "Browser audio muted (--mute-audio active)")
 
+            # เพิ่ม JS ปิดเสียงทุก audio/video เพื่อความเงียบสนิท (ไม่มี overlay)
+            try:
+                self.context.add_init_script(script=r"""
+                    (() => {
+                        const muteAll = () => {
+                            document.querySelectorAll('audio, video').forEach(el => {
+                                try { el.muted = true; el.volume = 0; } catch(e) {}
+                            });
+                        };
+                        if (document.readyState === 'loading') {
+                            document.addEventListener('DOMContentLoaded', muteAll);
+                        }
+                        try { new MutationObserver(muteAll).observe(document.documentElement || document.body, {childList:true, subtree:true}); } catch(e) {}
+                        setInterval(muteAll, 800);
+                    })();
+                """)
+                self.logger.info("[AUDIO] JS mute script installed (ปิดเสียงทุก media)")
+            except Exception as e:
+                self.logger.debug(f"[AUDIO] JS mute install warning: {e}")
             self._install_pronunciation_init()
 
             self.page.goto("https://portal.speexx.com/",

@@ -7,6 +7,16 @@ from datetime import datetime
 
 from ..solvers import ExerciseEngine
 from ..ui_utils import Fore, Style, pad_display, truncate_display
+try:
+    from ..speed_config import get as _speed
+except Exception:
+    _speed = lambda k, d=None: d
+def _sp(k, d):
+    try:
+        v = _speed(k)
+        return float(v) if v is not None else d
+    except Exception:
+        return d
 
 
 class ModalAndPageMixin:
@@ -80,7 +90,7 @@ class ModalAndPageMixin:
             self.print_status("ERROR", f"Error: {str(e)}")
             self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
 
-    def get_total_exercises(self, retries=4, wait_seconds=1.5):
+    def get_total_exercises(self, retries=None, wait_seconds=None):
         selectors = [
             ".exercises-large-navigation.visible-lg li",
             ".exercises-large-navigation.visible-md li",
@@ -88,6 +98,10 @@ class ModalAndPageMixin:
             ".exercises-large-navigation li",
             ".exercises-small-navigation li",
         ]
+        if retries is None:
+            retries = int(_sp("GET_TOTAL_RETRIES", 4))
+        if wait_seconds is None:
+            wait_seconds = _sp("GET_TOTAL_WAIT_SECONDS", 1.5)
         for attempt in range(retries):
             try:
                 for sel in selectors:
@@ -109,8 +123,10 @@ class ModalAndPageMixin:
         )
         return 0
 
-    def wait_for_exercise_content_ready(self, timeout=8.5):
+    def wait_for_exercise_content_ready(self, timeout=None):
         """Wait until the current exercise page has mounted its real type-* class and interactive DOM (or real <video>)."""
+        if timeout is None:
+            timeout = _sp("WAIT_EXERCISE_CONTENT_READY_TIMEOUT", 8.5)
         deadline = time.time() + float(timeout)
         start_ts = time.time()
         while time.time() < deadline:
@@ -163,11 +179,11 @@ class ModalAndPageMixin:
                     )
                 )
                 if ready:
-                    time.sleep(0.45)
+                    time.sleep(_sp("WAIT_EXERCISE_CONTENT_READY_SETTLE", 0.45))
                     return True
             except Exception:
                 pass
-            time.sleep(0.18)
+            time.sleep(_sp("WAIT_EXERCISE_CONTENT_INTERVAL", 0.18))
         return False
 
     def navigate_to_exercise_page(self, num):
@@ -211,8 +227,8 @@ class ModalAndPageMixin:
             if nav_info.get("alreadyActive") and (
                 num == 1 or "/exercise/" not in cur_clean_url or cur_clean_url.endswith(f"/exercise/{int(num)}")
             ):
-                self.wait_for_exercise_content_ready(timeout=8.0)
-                time.sleep(0.3)
+                self.wait_for_exercise_content_ready(timeout=_sp("NAVIGATE_PAGE_TIMEOUT", 8.0))
+                time.sleep(_sp("NAVIGATE_PAGE_SETTLE", 0.3))
                 return True
 
             prev_url = ""
@@ -228,16 +244,16 @@ class ModalAndPageMixin:
 
             # Wait briefly for route `/exercise/<num>` update when SPA uses numbered exercise URLs
             if "/exercise/" in prev_url:
-                url_deadline = time.time() + 4.0
+                url_deadline = time.time() + _sp("NAVIGATE_URL_WAIT", 4.0)
                 expected_suffix = f"/exercise/{int(num)}"
                 while time.time() < url_deadline:
                     cur_u = (self.page.url or "").split("?")[0]
                     if cur_u.endswith(expected_suffix):
                         break
-                    time.sleep(0.12)
+                    time.sleep(_sp("NAVIGATE_URL_INTERVAL", 0.12))
 
-            self.wait_for_exercise_content_ready(timeout=8.0)
-            time.sleep(0.45)
+            self.wait_for_exercise_content_ready(timeout=_sp("NAVIGATE_PAGE_TIMEOUT", 8.0))
+            time.sleep(_sp("WAIT_EXERCISE_CONTENT_READY_SETTLE", 0.45))
             return True
         except Exception as e:
             self.logger.debug(f"[NAV] navigate_to_exercise_page({num}) error: {e}")
@@ -335,7 +351,9 @@ class ModalAndPageMixin:
             return ""
         return clean.lower()
 
-    def wait_for_completion_modal(self, timeout=15):
+    def wait_for_completion_modal(self, timeout=None):
+        if timeout is None:
+            timeout = _sp("MODAL_WAIT_TIMEOUT", 15)
         deadline = time.time() + float(timeout)
         start_t = time.time()
         while time.time() < deadline:
@@ -349,8 +367,10 @@ class ModalAndPageMixin:
         self.print_status("WAIT", f"Completion modal NOT detected within {timeout}s")
         return False
 
-    def wait_for_modal_settled(self, timeout=5.0):
+    def wait_for_modal_settled(self, timeout=None):
         """Wait for Completion Modal loading spinner to finish and score + #nextButton to hydrate."""
+        if timeout is None:
+            timeout = _sp("MODAL_SETTLED_TIMEOUT", 5.0)
         deadline = time.time() + float(timeout)
         while time.time() < deadline:
             try:
@@ -397,7 +417,7 @@ class ModalAndPageMixin:
                     )
                 )
                 if settled:
-                    time.sleep(0.18)
+                    time.sleep(_sp("MODAL_SETTLED_INTERVAL", 0.18))
                     return True
             except Exception:
                 pass

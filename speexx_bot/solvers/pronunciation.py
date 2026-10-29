@@ -2,13 +2,25 @@
 
 import base64
 import time
-import requests
+try:
+    import requests
+except Exception:  # sandbox without deps
+    requests = None
 
 from .base import BaseSolver
+try:
+    from ..speed_config import get as _speed
+    exec("_sp=_speed")
+except Exception:
+    _speed = lambda k, d=None: d
+    _sp = _speed
+
 
 
 class PronunciationSolver(BaseSolver):
-    RECORD_DURATION = 8
+    @property
+    def RECORD_DURATION(self):
+        return _sp("PRON_RECORD_DURATION", 8.0)
     PASSING_SCORE = 51
     MAX_CORRECTION_ROUNDS = 3
     _audio_url_cache = []
@@ -60,7 +72,7 @@ class PronunciationSolver(BaseSolver):
         for _ in range(5):
             if self._handle_audio_setup_modal():
                 break
-            time.sleep(0.5)
+            time.sleep(_sp("PRON_MIC_SETTLE", 0.5))
 
         item_locator = self.page.locator(".exercise-items .item")
         item_count = item_locator.count()
@@ -370,6 +382,8 @@ class PronunciationSolver(BaseSolver):
                     ),
                     'Referer': 'https://portal.speexx.com/',
                 }
+                if requests is None:
+                    continue
                 resp = requests.get(url, headers=headers, timeout=15)
                 if resp.status_code == 200:
                     b64 = base64.b64encode(resp.content).decode('ascii')
@@ -445,9 +459,16 @@ class PronunciationSolver(BaseSolver):
                 record_duration = max(3.5, min(reference_duration + 1.5, 15.0))
             self.step(f"Recording duration: {record_duration:.1f}s")
             time.sleep(record_duration)
-            mic.click(timeout=3000, force=True)
+            try:
+                mic.click(timeout=3000, force=True)
+            except Exception:
+                time.sleep(0.5)
+                try: mic.click(timeout=1500, force=True)
+                except Exception: pass
             self.step("Mic stopped")
-            time.sleep(0.5)
+            time.sleep(_sp("PRON_MIC_SETTLE", 0.5))
+            # Dismiss any lingering mic permission banner
+            self._handle_audio_setup_modal()
             return True
         except Exception as e:
             self.logger.error(f"Record error: {e}")
