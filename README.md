@@ -81,6 +81,41 @@ The app opens Chrome so you can choose an account and sign in. If your saved ses
 3. เลือกทำอัตโนมัติ หรือเลือกโหมดทำแบบฝึกหัดใหม่ต่อเนื่อง / Choose Auto Solve or the new-exercise learning path.
 4. เลือกว่าจะทำซ้ำทุกข้อ หรือข้ามข้อที่ผ่านแล้ว / Choose whether to solve passed items again or skip them.
 
+## โครงสร้างโค้ด / Project Structure
+
+```text
+Speexx/
+├── main.py                           # จุดเริ่มต้นรันโปรแกรม (Entry point: py main.py / run.bat)
+└── speexx_bot/
+    ├── constants.py                  # ค่าคงที่ เวลาหน่วง และชนิดแบบฝึกหัดที่ไม่รองรับ
+    ├── translations.py               # ข้อความสองภาษา (ไทย / อังกฤษ)
+    ├── ui_utils.py                   # สีและตัวช่วยจัดความกว้างตารางภาษาไทยบนคอนโซล
+    ├── logging_utils.py              # TeeLogger สำหรับแสดงผลและบันทึก log.txt พร้อมกัน
+    ├── solvers/                      # ตัวแก้โจทย์แยกตามประเภทแบบฝึกหัด
+    │   ├── base.py                   # BaseSolver (ปุ่ม Correction/Solution/Repeat/Start, อ่านคะแนน, ลากวาง)
+    │   ├── engine.py                 # ExerciseEngine (ตรวจชนิดโจทย์และเรียก Solver ที่ตรงกัน)
+    │   ├── answer.py                 # กรอกคำตอบในช่องว่าง (type-answer)
+    │   ├── drag_drop.py              # ลากวางคำตอบและตาราง (type-drag-drop / type-drag-drop-table)
+    │   ├── single_choice.py          # ตัวเลือกคำตอบเดียว (type-single-choice)
+    │   ├── multiple_choice.py        # ตัวเลือกหลายคำตอบ (type-multiple-choice)
+    │   ├── scrambled_sentence.py     # เรียงประโยค (type-scrambled-sentence)
+    │   ├── scrambled_table.py        # เรียงตาราง (type-scrambled-table)
+    │   ├── picture_choice.py         # เลือกรูปภาพ (type-picture-choice)
+    │   ├── toggle_solution.py        # สลับตัวเลือกในช่องว่าง (type-toggle-solution)
+    │   ├── mark_text.py              # ทำเครื่องหมายข้อความ (type-mark-the-text)
+    │   ├── pronunciation.py          # ฝึกออกเสียง (type-pronunciation / single-item-pronunciation)
+    │   └── video.py                  # แบบฝึกหัดวิดีโอ (type-video)
+    └── cli/                          # ส่วนควบคุมเมนู การนำทาง และการทำงานต่อเนื่อง
+        ├── app.py                    # SpeexxBotCLI (เมนูหลัก, เลือกภาษา, Multi-account, Auto-run)
+        ├── accounts_browser_mixin.py # จัดการบัญชี เปิด Chrome (--mute-audio) และเข้าสู่ระบบ
+        ├── results_nav_mixin.py      # นำทางหน้า /results เลือกบทเรียน และขยาย Show more
+        ├── exercise_list_mixin.py    # ดึงรายการแบบฝึกหัดสดจากหน้าเว็บและคลิกเข้าข้อสอบ
+        ├── modal_page_mixin.py       # เปลี่ยนหน้าย่อย จัดการหน้าสรุปผล (Completion Modal) และ Dump HTML
+        ├── runner_mixin.py           # ลูปทำโจทย์อัตโนมัติและเดินหน้าทำแบบฝึกหัดถัดไปต่อเนื่อง
+        ├── answer_db_mixin.py        # บันทึก/โหลดฐานข้อมูล reports/answers_<chapter>.json และค้นหาคำตอบ
+        └── diagnostics_mixin.py      # ระบบบันทึก log รายรอบและจับภาพ/HTML เมื่อเกิดปัญหา
+```
+
 ## ไฟล์ที่สร้าง / Generated Files
 
 | Path | ใช้เก็บ / Used for |
