@@ -360,33 +360,19 @@ class SpeexxBotCLI(
                 self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
 
     def pronunciation_settings_menu(self):
+        # ย้อนกลับเป็นระบบเดิมตามคำขอ - แสดงข้อมูลระบบเดิม (single/multiple)
         self.print_header()
         print(f"  {Fore.CYAN}--- {self.T.get('pron_menu_title', 'ตั้งค่าฝึกออกเสียง')} ---{Style.RESET_ALL}\n")
-        try:
-            from ..speed_config import get, set_value, get_default
-        except Exception:
-            self.print_status("ERROR", "โหลด config ไม่ได้")
-            self._input(f"  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
-            return
-        cur = get("PRON_RECORD_DURATION")
-        print(f"  เวลาอัดเสียงปัจจุบัน: {Fore.CYAN}{cur}s{Style.RESET_ALL} (default {get_default('PRON_RECORD_DURATION')}s)")
-        print(f"  {Fore.YELLOW}คำแนะนำ: 6-10 วินาทีสำหรับประโยคสั้น, 10-15 วินาทีสำหรับประโยคยาว{Style.RESET_ALL}\n")
-        print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} ตั้งเวลาอัด (วินาที)")
-        print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} สลับโหมดปิดเสียง (mute) — ตอนนี้: {'เปิด' if self._is_muted() else 'ปิด'}")
+        print(f"  {Fore.GREEN}ระบบฝึกออกเสียงย้อนกลับเป็นแบบเดิมแล้ว (single/multiple){Style.RESET_ALL}")
+        print(f"  เวลาอัดเสียง: {Fore.CYAN}8.0s (ค่าตายตัวแบบเดิม){Style.RESET_ALL} | พักหลังกดไมค์ 0.5s")
+        print(f"  {Fore.YELLOW}หมายเหตุ: การปรับ PRON_RECORD_DURATION ใน Speed config จะไม่มีผลกับระบบเดิม{Style.RESET_ALL}\n")
+        print(f"  {Fore.WHITE}[1]{Style.RESET_ALL} ดูข้อมูลระบบเดิม")
+        print(f"  {Fore.WHITE}[2]{Style.RESET_ALL} โหมดปิดเสียง (mute) — ตอนนี้: {'เปิด' if self._is_muted() else 'ปิด'}")
         print(f"  {Fore.WHITE}[0]{Style.RESET_ALL} กลับ")
         try:
             c = self._input(f"\n  {Fore.CYAN}[>] Select: {Style.RESET_ALL}").strip()
             if c == "1":
-                nv = self._input(f"  {Fore.CYAN}[>] ใส่เวลาอัดใหม่ (วินาที): {Style.RESET_ALL}").strip()
-                try:
-                    v = float(nv)
-                    if 3 <= v <= 20:
-                        set_value("PRON_RECORD_DURATION", v)
-                        self.print_status("OK", f"ตั้งเวลาอัดเป็น {v}s แล้ว")
-                    else:
-                        self.print_status("ERROR", "ต้องอยู่ระหว่าง 3-20 วินาที")
-                except ValueError:
-                    self.print_status("ERROR", "ต้องเป็นตัวเลข")
+                self.print_status("INFO", "ระบบเดิม: RECORD_DURATION=8.0s, mic settle 0.5s, รองรับทั้ง single และ multiple items แบบเดิม")
                 self._input(f"  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
             elif c == "2":
                 self.print_status("INFO", "โหมดปิดเสียง (mute) เปิดอยู่เสมอ — ไม่มีการซ้อนเว็บ/แจ้งเตือน")
