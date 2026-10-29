@@ -408,29 +408,36 @@ class BaseSolver:
                     const isVis = (el) => {
                         if (!el) return false;
                         const st = window.getComputedStyle(el);
-                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                        if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
                         const r = el.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
                     };
+                    if (isVis(document.querySelector('.circliful-and-results')) || isVis(document.querySelector('.exercise-result-container'))) {
+                        return true;
+                    }
+                    for (const b of document.querySelectorAll("button, [role='button']")) {
+                        if (b.disabled || !isVis(b)) continue;
+                        if (b.closest('.circliful-and-results, .modal, .modal-dialog')) continue;
+                        const cls = (b.className || '').toString().toLowerCase();
+                        if (cls.includes('disabled')) continue;
+                        const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                        if (/\\b(correction|correct)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(txt)) {
+                            // Correction button is still enabled -> grading has NOT completed yet (ignore stale 0/100 badge!)
+                            return false;
+                        }
+                    }
                     if (isVis(document.querySelector('.result-badge-text'))) return true;
-                    if (isVis(document.querySelector('.exercise-result-container'))) return true;
-                    if (isVis(document.querySelector('.circliful-and-results'))) return true;
                     for (const b of document.querySelectorAll("button, [role='button'], a")) {
-                        if (!isVis(b)) continue;
+                        if (!isVis(b) || b.disabled) continue;
                         const cls = (b.className || '').toString().toLowerCase();
                         const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
-                        if (/\\b(solution|repeat)\\b/.test(cls)) return true;
-                        if (/(solution|เฉลย|repeat|try again|ทำซ้ำ|continue learning|เรียนรู้ต่อ)/.test(txt)) return true;
+                        if (/\\b(solution|repeat|next)\\b/.test(cls)) return true;
+                        if (/(solution|เฉลย|repeat|try again|ทำซ้ำ|continue learning|เรียนรู้ต่อ|\\bnext\\b|ถัดไป)/.test(txt)) return true;
                     }
                     const graded = document.querySelector(
                         '.status-green, .status-red, .result-green, .result-red, .score-bar, .result-bar'
                     );
-                    if (graded) return true;
-                    const bodyTxt = (document.body ? (document.body.innerText || '') : '');
-                    if (/(Very good|Excellent|Well done|Great job|Try again|You can do better|100\\/100 Result|ดีมาก|ยอดเยี่ยม|ทำได้ดีมาก|ลองอีกครั้ง)/.test(bodyTxt)) {
-                        return true;
-                    }
-                    return false;
+                    return Boolean(graded);
                 }
             """))
         except Exception:
@@ -460,53 +467,36 @@ class BaseSolver:
         ]
         try:
             clicked = False
-            fast_btn = self._locate_action_button("correction", wait_timeout=1.6)
+            fast_btn = self._locate_action_button("correction", wait_timeout=2.2)
             if fast_btn is not None:
                 clicked = self._safe_click(fast_btn, timeout=3500, description="correction")
             if not clicked:
-                clicked = self._click_first_matching(selectors, description="correction", vis_timeout=600)
+                clicked = self._click_first_matching(selectors, description="correction", vis_timeout=800)
 
             if not clicked:
                 self.verify_step("กดปุ่มตรวจสอบ [Correction]", False, "ไม่พบปุ่มตรวจสอบ")
                 return False
 
-            ready = self._wait_until_js(
-                """
-                () => {
-                    const isVis = (el) => {
-                        if (!el) return false;
-                        const st = window.getComputedStyle(el);
-                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
-                        const r = el.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
-                    };
-                    if (isVis(document.querySelector('.result-badge-text'))) return true;
-                    if (isVis(document.querySelector('.exercise-result-container'))) return true;
-                    if (isVis(document.querySelector('.circliful-and-results'))) return true;
-                    for (const b of document.querySelectorAll("button, [role='button'], a")) {
-                        if (!isVis(b)) continue;
-                        const cls = (b.className || '').toString().toLowerCase();
-                        const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
-                        if (/\\b(solution|repeat)\\b/.test(cls)) return true;
-                        if (/(solution|เฉลย|repeat|try again|ทำซ้ำ|continue learning|เรียนรู้ต่อ)/.test(txt)) return true;
-                    }
-                    if (document.querySelector('.status-green, .status-red, .result-green, .result-red, .score-bar, .result-bar')) return true;
-                    const bodyTxt = (document.body ? (document.body.innerText || '') : '');
-                    return /(Very good|Excellent|Well done|Great job|Try again|You can do better|100\\/100 Result|ดีมาก|ยอดเยี่ยม|ทำได้ดีมาก|ลองอีกครั้ง)/.test(bodyTxt);
-                }
-                """,
-                timeout=1.6,
-                interval=0.055,
-            )
+            deadline = time.time() + 4.0
+            ready = False
+            while time.time() < deadline:
+                if self._is_post_correction_ready():
+                    ready = True
+                    break
+                time.sleep(0.07)
+
             if not ready:
-                retry_btn = self._locate_action_button("correction", wait_timeout=0.5)
+                retry_btn = self._locate_action_button("correction", wait_timeout=0.6)
                 if retry_btn is not None:
                     self._safe_click(retry_btn, timeout=2500, description="correction-retry")
-                ready = self._wait_until_js(
-                    "() => Boolean(document.querySelector('.result-badge-text, button.solution, button.repeat, .status-green, .status-red'))",
-                    timeout=max(0.8, settle),
-                    interval=0.06,
-                )
+                retry_deadline = time.time() + max(1.2, settle + 1.0)
+                while time.time() < retry_deadline:
+                    if self._is_post_correction_ready():
+                        ready = True
+                        break
+                    time.sleep(0.07)
+
+            time.sleep(0.14)
             self.verify_step("กดปุ่มตรวจสอบ [Correction]", True, "ตรวจคำตอบแล้ว" if ready else "คลิกแล้ว")
             return True
         except Exception as e:
@@ -607,13 +597,53 @@ class BaseSolver:
         ]
         try:
             clicked = False
-            fast_btn = self._locate_action_button("repeat", wait_timeout=2.2)
+            fast_btn = self._locate_action_button("repeat", wait_timeout=1.5)
             if fast_btn is not None:
                 clicked = self._safe_click(fast_btn, timeout=3500, description="repeat")
             if not clicked:
-                clicked = self._click_first_matching(selectors, description="repeat", vis_timeout=500)
+                clicked = self._click_first_matching(selectors, description="repeat", vis_timeout=400)
 
             if not clicked:
+                # Check if Repeat is absent because the page is ALREADY editable (Correction enabled)
+                # OR because the page ALREADY scored >= PASS_LINE (Speexx hides Repeat on 100/100)!
+                already_ok = bool(
+                    self.page.evaluate(
+                        """
+                        (passLine) => {
+                            const isVis = (el) => {
+                                if (!el) return false;
+                                const st = window.getComputedStyle(el);
+                                if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0;
+                            };
+                            for (const b of document.querySelectorAll("button, [role='button']")) {
+                                if (b.disabled || !isVis(b)) continue;
+                                if (b.closest('.circliful-and-results, .modal, .modal-dialog')) continue;
+                                const cls = (b.className || '').toString().toLowerCase();
+                                if (cls.includes('disabled')) continue;
+                                const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                                if (/\\b(correction|correct|start-exercise)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ|\\bstart\\b|เริ่มต้น)/.test(txt)) {
+                                    return true;
+                                }
+                            }
+                            const badge = document.querySelector('.result-badge-text');
+                            if (badge && isVis(badge)) {
+                                const dr = parseInt(badge.getAttribute('data-result') || '', 10);
+                                if (!isNaN(dr) && dr >= passLine) return true;
+                                const m = (badge.innerText || badge.textContent || '').match(/\\d+/);
+                                if (m && parseInt(m[0], 10) >= passLine) return true;
+                            }
+                            return false;
+                        }
+                        """,
+                        self.PASS_LINE,
+                    )
+                )
+                if already_ok:
+                    self.logger.debug("[REPEAT] Page already editable or already passed — skipping Repeat click")
+                    return True
+
                 self.verify_step("กดปุ่มทำซ้ำ [Repeat]", False, "ไม่พบปุ่มทำซ้ำ")
                 return False
 
@@ -642,10 +672,10 @@ class BaseSolver:
                     return false;
                 }
                 """,
-                timeout=max(1.5, settle + 1.8),
+                timeout=max(2.0, settle + 2.2),
                 interval=0.05,
             )
-            time.sleep(0.12)
+            time.sleep(0.16)
             if self.has_start_button():
                 self.click_start()
             self.verify_step("กดปุ่มทำซ้ำ [Repeat]", True, "รีเซ็ตหน้าพร้อมกรอกคำตอบแล้ว" if reset_ok else "คลิกแล้ว")
@@ -733,10 +763,26 @@ class BaseSolver:
                     const isVis = (el) => {
                         if (!el) return false;
                         const st = window.getComputedStyle(el);
-                        if (st.display === 'none' || st.visibility === 'hidden') return false;
+                        if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
                         const r = el.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
                     };
+
+                    // If Completion Modal is NOT open and Correction button is still enabled,
+                    // any visible .result-badge-text is a STALE score from before Repeat!
+                    const modalOpen = isVis(document.querySelector('.circliful-and-results')) || isVis(document.querySelector('.exercise-result-container'));
+                    if (!modalOpen) {
+                        for (const b of document.querySelectorAll("button, [role='button']")) {
+                            if (b.disabled || !isVis(b)) continue;
+                            if (b.closest('.circliful-and-results, .modal, .modal-dialog')) continue;
+                            const cls = (b.className || '').toString().toLowerCase();
+                            if (cls.includes('disabled')) continue;
+                            const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                            if (/\\b(correction|correct)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(txt)) {
+                                return -1;
+                            }
+                        }
+                    }
 
                     const badge = document.querySelector('.result-badge-text');
                     if (badge && isVis(badge)) {
@@ -815,9 +861,9 @@ class BaseSolver:
             if score is not None:
                 return score
             if wait_for_score:
-                deadline = time.time() + 0.55
+                deadline = time.time() + 1.5
                 while time.time() < deadline:
-                    time.sleep(0.06)
+                    time.sleep(0.08)
                     score = self._read_score_once_js()
                     if score is not None:
                         return score
@@ -827,11 +873,20 @@ class BaseSolver:
 
     def wait_for_page_ready(self):
         try:
-            self.page.wait_for_selector(".exercise, .video", state="visible", timeout=10000)
+            self.page.wait_for_selector(".exercise, video", state="visible", timeout=10000)
             self._wait_until_js(
-                "() => Boolean(document.querySelector('.exercise-items, video, button.start-exercise, .instructions-text'))",
-                timeout=1.5,
-                interval=0.05,
+                """
+                () => Boolean(
+                    document.querySelector(
+                        '.exercise-items .item, .exercise-items input, .exercise-items .drag-drop-placeholder, ' +
+                        '.exercise-items .drag-drop, .exercise-items .gap, .exercise-items .word, ' +
+                        '.draggable-container .drag-drop, button.start-exercise, video[src], video source[src], ' +
+                        '[class*="pronunciation"]'
+                    )
+                )
+                """,
+                timeout=4.0,
+                interval=0.07,
             )
             return True
         except Exception:

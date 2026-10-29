@@ -21,8 +21,7 @@ class ExerciseListMixin:
         self.print_header()
         print(f"  {Fore.CYAN}--- {self.T['available_chapters']} ---{Style.RESET_ALL}\n")
         try:
-            current_url = self.page.url.lower()
-            if "/results" not in current_url:
+            if not self._is_on_results_page():
                 self.print_status("INFO", "Navigating to Progress page...")
                 if not self.navigate_to_results():
                     return
@@ -71,7 +70,7 @@ class ExerciseListMixin:
             self._load_answer_db(name, announce=True)
 
             already_navigated = False
-            if "/results" not in (self.page.url or "").lower():
+            if not self._is_on_results_page():
                 if not self.navigate_to_results():
                     return
                 already_navigated = True
@@ -473,10 +472,10 @@ class ExerciseListMixin:
 
     def _click_row_safely(self, title, wait_timeout=15000, row_index=None, click_inner_cell=False):
         row = None
-        url_low = (self.page.url or "").lower()
+        on_results = self._is_on_results_page()
 
         # Fast path: if already on /results with visible rows, inspect once and click immediately
-        if "/results" in url_low:
+        if on_results:
             try:
                 row = self._find_matching_exercise_row(title, row_index=row_index)
             except Exception as e:
@@ -484,7 +483,7 @@ class ExerciseListMixin:
 
         if row is None:
             try:
-                if "/results" not in url_low or self._count_visible_exercise_rows() == 0:
+                if not self._is_on_results_page() or self._count_visible_exercise_rows() == 0:
                     self.logger.info("[CLICK] Exercise table empty or off /results — recovering chapter & Exercises view")
                     self._ensure_results_chapter_and_exercises_ready(
                         force_chapter_click=False,
@@ -554,16 +553,32 @@ class ExerciseListMixin:
             except Exception:
                 target = row
 
+        def _opened_packet():
+            try:
+                cur_u = self.page.url or ""
+                base_u = cur_u.split("?")[0].lower()
+                return "/results" not in base_u and bool(self._extract_packet_key(cur_u))
+            except Exception:
+                return False
+
         for mode_label, click_fn in (
             ("normal", lambda: target.click(timeout=3000)),
-            ("force", lambda: target.click(timeout=3000, force=True)),
-            ("JS", lambda: target.evaluate("el => el.click()")),
+            ("force", lambda: target.click(timeout=2500, force=True)),
+            ("JS", lambda: target.evaluate("el => el.click()", timeout=2500)),
         ):
+            if _opened_packet():
+                self.logger.info(f"[CLICK] '{title}' already navigated to packet ({self.page.url})")
+                return True
             try:
                 click_fn()
                 self.logger.info(f"[CLICK] '{title}' clicked ({mode_label}, inner={click_inner_cell})")
                 return True
             except Exception as e:
+                if _opened_packet():
+                    self.logger.info(
+                        f"[CLICK] '{title}' navigated during {mode_label} click ({self.page.url})"
+                    )
+                    return True
                 self.logger.debug(f"[CLICK] {mode_label} click failed: {str(e)[:120]}")
 
-        return False
+        return _opened_packet()

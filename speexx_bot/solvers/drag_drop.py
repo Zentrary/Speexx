@@ -21,31 +21,133 @@ class DragDropSolver(BaseSolver):
     def _is_empty_answer(cls, answer):
         return answer == cls.EMPTY_TILE
 
+    def _sync_dnd_dom(self):
+        """Tag visible logical slots inside .exercise-items and visible unused tiles inside .draggable-container."""
+        try:
+            data = self.page.evaluate(
+                """
+                () => {
+                    for (const old of document.querySelectorAll('[data-speexx-dnd-slot]')) {
+                        old.removeAttribute('data-speexx-dnd-slot');
+                    }
+                    for (const old of document.querySelectorAll('[data-speexx-dnd-src]')) {
+                        old.removeAttribute('data-speexx-dnd-src');
+                    }
+
+                    const isVis = (el, stopRoot) => {
+                        if (!el) return false;
+                        let cur = el;
+                        while (cur && cur !== document.body) {
+                            if (cur.classList && cur.classList.contains('ng-hide')) return false;
+                            const st = window.getComputedStyle(cur);
+                            if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) {
+                                return false;
+                            }
+                            if (cur === stopRoot) break;
+                            cur = cur.parentElement;
+                        }
+                        const r = el.getBoundingClientRect();
+                        return r.width > 2 && r.height > 2;
+                    };
+
+                    const getText = (el) => {
+                        if (!el) return '';
+                        const raw = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        if (raw) return raw;
+                        const img = el.querySelector('img');
+                        if (img) {
+                            return (img.getAttribute('alt') || img.getAttribute('title') || img.getAttribute('src') || '').trim();
+                        }
+                        return '';
+                    };
+
+                    const exRoot = document.querySelector('.exercise-items');
+                    const rawCands = exRoot
+                        ? Array.from(exRoot.querySelectorAll('.drag-drop-placeholder, .drag-drop'))
+                              .filter(el => !el.closest('.draggable-container') && isVis(el, exRoot))
+                        : [];
+                    const candSet = new Set(rawCands);
+
+                    const logicalSlots = rawCands.filter(el => {
+                        const isPh = el.classList.contains('drag-drop-placeholder');
+                        if (isPh) {
+                            // If a visible .drag-drop child is inside this placeholder, prefer the inner .drag-drop
+                            const innerVisTile = Array.from(el.querySelectorAll('.drag-drop')).find(ch => ch !== el && candSet.has(ch));
+                            if (innerVisTile) return false;
+                        }
+                        // Skip nested .drag-drop inside another visible .drag-drop
+                        let p = el.parentElement;
+                        while (p && p !== exRoot) {
+                            if (candSet.has(p) && !p.classList.contains('drag-drop-placeholder')) {
+                                return false;
+                            }
+                            p = p.parentElement;
+                        }
+                        return true;
+                    });
+
+                    const slots = logicalSlots.map((el, idx) => {
+                        el.setAttribute('data-speexx-dnd-slot', String(idx));
+                        return {
+                            idx,
+                            text: getText(el),
+                            isPlaceholder: el.classList.contains('drag-drop-placeholder'),
+                        };
+                    });
+
+                    const poolRoot = document.querySelector('.draggable-container');
+                    const rawPool = poolRoot
+                        ? Array.from(poolRoot.querySelectorAll('.drag-drop')).filter(el => isVis(el, poolRoot))
+                        : [];
+                    const poolSet = new Set(rawPool);
+                    const visSources = rawPool.filter(el => {
+                        let p = el.parentElement;
+                        while (p && p !== poolRoot) {
+                            if (poolSet.has(p)) return false;
+                            p = p.parentElement;
+                        }
+                        const txt = getText(el);
+                        return txt.length > 0;
+                    });
+
+                    const sources = visSources.map((el, idx) => {
+                        el.setAttribute('data-speexx-dnd-src', String(idx));
+                        return {
+                            idx,
+                            text: getText(el),
+                            groupId: el.getAttribute('data-group-id') || '',
+                        };
+                    });
+
+                    return { slots, sources };
+                }
+                """
+            )
+            if isinstance(data, dict):
+                return {
+                    "slots": data.get("slots") or [],
+                    "sources": data.get("sources") or [],
+                }
+        except Exception as e:
+            self.logger.debug(f"[DND] _sync_dnd_dom error: {e}")
+        return {"slots": [], "sources": []}
+
     def _slot_answers(self):
-        placeholders = self.page.locator(".exercise-items .drag-drop-placeholder").all()
+        state = self._sync_dnd_dom()
+        slots = state["slots"]
+        if slots:
+            return [self._answer_text(s.get("text", "")) for s in slots]
         tiles = self.page.locator(
-            ".exercise-items .drag-drop:not(.draggable-container .drag-drop)"
+            ".exercise-items [data-drag-drop-id]:not(.draggable-container [data-drag-drop-id])"
         ).all()
-        if placeholders and len(placeholders) >= len(tiles) and any(
-            ph.locator(".drag-drop").count() > 0 for ph in placeholders
-        ):
-            out = []
-            for ph in placeholders:
-                inner = ph.locator(".drag-drop").first
-                if inner.count() > 0:
-                    out.append(self._answer_text(inner.inner_text()))
-                else:
-                    txt = self._normalise(ph.inner_text())
-                    out.append(self._answer_text(txt) if txt else self.EMPTY_TILE)
-            return out
-        if not tiles:
-            tiles = self.page.locator(
-                ".exercise-items [data-drag-drop-id]:not(.draggable-container [data-drag-drop-id])"
-            ).all()
         return [self._answer_text(tile.inner_text()) for tile in tiles]
 
     def _source_tiles(self):
-        return self.page.locator(".draggable-container .drag-drop").all()
+        state = self._sync_dnd_dom()
+        return [
+            self.page.locator(f"[data-speexx-dnd-src='{s['idx']}']").first
+            for s in state["sources"]
+        ]
 
     def _tile_text(self, tile):
         try:
@@ -136,31 +238,49 @@ class DragDropSolver(BaseSolver):
         return self._restore_by_group_id()
 
     def _all_slot_targets(self):
-        placeholders = self.page.locator(".exercise-items .drag-drop-placeholder").all()
-        combined = self.page.locator(
-            ".exercise-items .drag-drop-placeholder, "
-            ".exercise-items .drag-drop:not(.drag-drop-placeholder .drag-drop):not(.draggable-container .drag-drop)"
-        ).all()
-        if len(combined) > len(placeholders):
-            return combined
-        return placeholders
+        state = self._sync_dnd_dom()
+        return [
+            self.page.locator(f"[data-speexx-dnd-slot='{s['idx']}']").first
+            for s in state["slots"]
+        ]
 
     def _count_matching_slots(self, answers):
         expected = 0
         matched = 0
-        slots = self._all_slot_targets()
+        slots = self._sync_dnd_dom()["slots"]
         for idx, answer in enumerate(answers):
             if answer is None or answer == "" or self._is_empty_answer(answer):
                 continue
             expected += 1
             if idx < len(slots):
-                try:
-                    cur = self._answer_text(slots[idx].inner_text())
-                    if cur.casefold() == self._answer_text(answer).casefold():
-                        matched += 1
-                except Exception:
-                    pass
+                cur = self._answer_text(slots[idx].get("text", ""))
+                if cur.casefold() == self._answer_text(answer).casefold():
+                    matched += 1
         return matched, expected
+
+    def _wait_slot_matches(self, slot_index, wanted_text, timeout=0.28):
+        wanted_cf = self._answer_text(wanted_text).casefold()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            slots = self._sync_dnd_dom()["slots"]
+            if slot_index < len(slots):
+                cur_cf = self._answer_text(slots[slot_index].get("text", "")).casefold()
+                if cur_cf == wanted_cf:
+                    return True
+            time.sleep(0.045)
+        return False
+
+    @classmethod
+    def _pick_matching_source_idx(cls, sources, wanted_text):
+        wanted = cls._answer_text(wanted_text)
+        for src in sources:
+            if cls._answer_text(src.get("text", "")) == wanted:
+                return src["idx"]
+        wanted_cf = wanted.casefold()
+        for src in sources:
+            if cls._answer_text(src.get("text", "")).casefold() == wanted_cf:
+                return src["idx"]
+        return None
 
     def _fill_slots(self, answers):
         moved = 0
@@ -173,32 +293,40 @@ class DragDropSolver(BaseSolver):
             if expected_now > 0 and matched_now >= expected_now:
                 break
 
+            if repair_pass > 0:
+                destination_armed = False
+
             for index, answer in enumerate(answers):
-                slots = self._all_slot_targets()
-                if answer is None or answer == "" or self._is_empty_answer(answer) or index >= len(slots):
+                if answer is None or answer == "" or self._is_empty_answer(answer):
                     destination_armed = False
                     continue
-                wanted = self._answer_text(answer)
-                try:
-                    existing_slot_text = self._answer_text(slots[index].inner_text())
-                    if existing_slot_text.casefold() == wanted.casefold():
-                        destination_armed = False
-                        continue
-                except Exception:
-                    pass
 
-                source = None
-                for candidate in self._source_tiles():
-                    if self._answer_text(self._tile_text(candidate)) == wanted:
-                        source = candidate
-                        break
-                if source is None:
-                    for candidate in self._source_tiles():
-                        candidate_text = self._answer_text(self._tile_text(candidate))
-                        if candidate_text.casefold() == wanted.casefold():
-                            source = candidate
-                            break
-                if source is None:
+                wanted = self._answer_text(answer)
+                state = self._sync_dnd_dom()
+                slots_info = state["slots"]
+                if index >= len(slots_info):
+                    destination_armed = False
+                    continue
+
+                existing_slot_text = self._answer_text(slots_info[index].get("text", ""))
+                if existing_slot_text.casefold() == wanted.casefold():
+                    destination_armed = False
+                    continue
+
+                # If a wrong tile is occupying this slot, click it back to the pool first
+                if not self._is_empty_answer(existing_slot_text):
+                    try:
+                        wrong_loc = self.page.locator(f"[data-speexx-dnd-slot='{index}']").first
+                        wrong_loc.click(timeout=1500)
+                        time.sleep(0.08)
+                        destination_armed = False
+                        state = self._sync_dnd_dom()
+                        slots_info = state["slots"]
+                    except Exception:
+                        destination_armed = False
+
+                src_idx = self._pick_matching_source_idx(state["sources"], wanted)
+                if src_idx is None:
                     self.logger.debug(
                         "Tile already placed or unavailable for slot %s: %r", index, answer
                     )
@@ -209,84 +337,53 @@ class DragDropSolver(BaseSolver):
                 used_drag = False
                 if repair_pass == 0:
                     try:
-                        before = len(self._source_tiles())
+                        slot_loc = self.page.locator(f"[data-speexx-dnd-slot='{index}']").first
+                        src_loc = self.page.locator(f"[data-speexx-dnd-src='{src_idx}']").first
                         if not destination_armed:
-                            slots[index].click(timeout=2000)
+                            slot_loc.click(timeout=2000)
+                            time.sleep(0.03)
                             destination_armed = True
-                        source.click(timeout=2000)
-                        time.sleep(0.06)
+                        src_loc.click(timeout=2000)
+                        placed = self._wait_slot_matches(index, wanted, timeout=0.25)
 
-                        live_slots = self._all_slot_targets()
-                        slot_text = (
-                            self._answer_text(live_slots[index].inner_text())
-                            if index < len(live_slots)
-                            else ""
-                        )
-                        source_still_present = any(
-                            self._answer_text(self._tile_text(candidate)) == wanted
-                            for candidate in self._source_tiles()
-                        )
-                        placed = (
-                            slot_text.casefold() == wanted.casefold()
-                            or len(self._source_tiles()) < before
-                            or not source_still_present
-                        )
-                        if not placed and destination_armed:
-                            live_slots = self._all_slot_targets()
-                            if index < len(live_slots):
-                                live_slots[index].click(timeout=1500)
-                                live_source = next(
-                                    (
-                                        c for c in self._source_tiles()
-                                        if self._answer_text(self._tile_text(c)).casefold() == wanted.casefold()
-                                    ),
-                                    None,
-                                )
-                                if live_source is not None:
-                                    live_source.click(timeout=1500)
-                                    time.sleep(0.06)
-                                    live_slots_after = self._all_slot_targets()
-                                    now_text = (
-                                        self._answer_text(live_slots_after[index].inner_text())
-                                        if index < len(live_slots_after)
-                                        else ""
-                                    )
-                                    placed = now_text.casefold() == wanted.casefold()
+                        if not placed:
+                            # Re-sync and explicitly arm target slot before clicking source tile
+                            destination_armed = False
+                            state = self._sync_dnd_dom()
+                            if index < len(state["slots"]):
+                                cur_after = self._answer_text(state["slots"][index].get("text", ""))
+                                if not self._is_empty_answer(cur_after) and cur_after.casefold() != wanted.casefold():
+                                    self.page.locator(f"[data-speexx-dnd-slot='{index}']").first.click(timeout=1500)
+                                    time.sleep(0.07)
+                                    state = self._sync_dnd_dom()
+                                retry_src_idx = self._pick_matching_source_idx(state["sources"], wanted)
+                                if retry_src_idx is not None and index < len(state["slots"]):
+                                    self.page.locator(f"[data-speexx-dnd-slot='{index}']").first.click(timeout=1500)
+                                    time.sleep(0.04)
+                                    self.page.locator(f"[data-speexx-dnd-src='{retry_src_idx}']").first.click(timeout=1500)
+                                    placed = self._wait_slot_matches(index, wanted, timeout=0.25)
+                                    destination_armed = placed
                     except Exception as e:
+                        destination_armed = False
                         self.logger.debug(f"[DND] Click-to-place failed for slot {index}: {e}")
 
                 if not placed:
                     destination_armed = False
-                    live_source = next(
-                        (
-                            c for c in self._source_tiles()
-                            if self._answer_text(self._tile_text(c)).casefold() == wanted.casefold()
-                        ),
-                        None,
-                    )
-                    live_slots = self._all_slot_targets()
-                    if live_source is not None and index < len(live_slots):
-                        if self.fast_drag(live_source, live_slots[index]):
-                            live_after = self._all_slot_targets()
-                            if index < len(live_after):
-                                try:
-                                    placed = (
-                                        self._answer_text(live_after[index].inner_text()).casefold()
-                                        == wanted.casefold()
-                                    )
-                                except Exception:
-                                    placed = False
+                    state = self._sync_dnd_dom()
+                    drag_src_idx = self._pick_matching_source_idx(state["sources"], wanted)
+                    if drag_src_idx is not None and index < len(state["slots"]):
+                        src_loc = self.page.locator(f"[data-speexx-dnd-src='{drag_src_idx}']").first
+                        slot_loc = self.page.locator(f"[data-speexx-dnd-slot='{index}']").first
+                        if self.fast_drag(src_loc, slot_loc):
+                            placed = self._wait_slot_matches(index, wanted, timeout=0.25)
                         if not placed:
-                            live_source = next(
-                                (
-                                    c for c in self._source_tiles()
-                                    if self._answer_text(self._tile_text(c)).casefold() == wanted.casefold()
-                                ),
-                                None,
-                            )
-                            live_slots = self._all_slot_targets()
-                            if live_source is not None and index < len(live_slots):
-                                placed = self.precise_drag(live_source, live_slots[index])
+                            state = self._sync_dnd_dom()
+                            drag_src_idx = self._pick_matching_source_idx(state["sources"], wanted)
+                            if drag_src_idx is not None and index < len(state["slots"]):
+                                src_loc = self.page.locator(f"[data-speexx-dnd-src='{drag_src_idx}']").first
+                                slot_loc = self.page.locator(f"[data-speexx-dnd-slot='{index}']").first
+                                if self.precise_drag(src_loc, slot_loc):
+                                    placed = self._wait_slot_matches(index, wanted, timeout=0.3) or True
                         used_drag = placed
 
                 if placed:
@@ -295,7 +392,7 @@ class DragDropSolver(BaseSolver):
                         drag_placed += 1
                     else:
                         click_placed += 1
-                    time.sleep(0.04)
+                    time.sleep(0.03)
 
         matched_final, expected_final = self._count_matching_slots(answers)
         self.verify_step(
