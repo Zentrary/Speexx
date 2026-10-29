@@ -141,7 +141,7 @@ class ExerciseEngine:
                 # Wait briefly for child items of this exercise to mount in DOM
                 item_deadline = min(deadline, time.time() + 2.0)
                 while time.time() < item_deadline:
-                    time.sleep(0.1)
+                    time.sleep(0.16)
                     try:
                         ready_now = self.page.evaluate(
                             """
@@ -166,7 +166,7 @@ class ExerciseEngine:
             if elapsed >= 1.2 and (probe.get("hasRealVideo") or probe.get("anyVisVideoTag")):
                 return "type-video"
 
-            time.sleep(0.12)
+            time.sleep(0.20)
 
         if detected:
             return detected

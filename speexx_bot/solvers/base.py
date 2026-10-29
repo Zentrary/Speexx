@@ -491,13 +491,38 @@ class BaseSolver:
         if getattr(self, 'force_solve', False):
             # If Speexx locked this page at 100/100 with NO Repeat button (only visited Correction + Next),
             # there is no Repeat or Solution button on this page — record its 100/100 answers and advance!
+            # ต้องมี badge/correction visited ชัดเจน ไม่ใช่คะแนนลอย ๆ จากการตรวจผิด
             if self.is_locked_perfect_score():
-                self.verify_step(
-                    "ตรวจสอบสถานะหน้าแบบฝึกหัด",
-                    True,
-                    "ได้คะแนน 100/100 อยู่แล้ว พร้อมไปหน้าถัดไป",
-                )
-                return True
+                # ยืนยันอีกครั้งว่า correction เป็น visited จริง ๆ และไม่มี active correction
+                try:
+                    has_active = bool(self.page.evaluate("""
+                        () => {
+                            const isVis = (el) => {
+                                if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                                const st = window.getComputedStyle(el);
+                                if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+                                const r = el.getBoundingClientRect();
+                                return r.width > 0 && r.height > 0;
+                            };
+                            for (const b of document.querySelectorAll("button, [role='button']")) {
+                                if (!isVis(b) || b.closest('.circliful-and-results, .modal, .modal-dialog')) continue;
+                                const cls = (b.className || '').toString().toLowerCase();
+                                if (/\\b(visited|disabled|btn-default|inactive)\\b/.test(cls)) continue;
+                                const txt = ((b.innerText||b.textContent||'')+' '+(b.getAttribute('aria-label')||'')).toLowerCase();
+                                if (/\\b(correction|correct)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(txt)) return true;
+                            }
+                            return false;
+                        }
+                    """))
+                    if not has_active and self._is_post_correction_ready():
+                        self.verify_step(
+                            "ตรวจสอบสถานะหน้าแบบฝึกหัด",
+                            True,
+                            "ได้คะแนน 100/100 อยู่แล้ว พร้อมไปหน้าถัดไป",
+                        )
+                        return True
+                except Exception:
+                    pass
             # If page was previously graded (< 100) and has an active Repeat button, reset it first so it's editable
             try:
                 needs_initial_reset = bool(
@@ -538,7 +563,37 @@ class BaseSolver:
             return False
         try:
             score = self.get_result_score(wait_for_score=False)
-            return score >= self.PASS_LINE
+            if score < self.PASS_LINE:
+                return False
+            # กัน false positive: ถ้ายังมีปุ่ม Correction สีส้ม active อยู่ แปลว่ายังไม่ได้ตรวจ ไม่ใช่ผ่านแล้ว
+            if not self._is_post_correction_ready():
+                return False
+            try:
+                has_active_corr = bool(self.page.evaluate("""
+                    () => {
+                        const isVis = (el) => {
+                            if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                            if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
+                            const st = window.getComputedStyle(el);
+                            if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0;
+                        };
+                        for (const b of document.querySelectorAll("button, [role='button']")) {
+                            if (!isVis(b)) continue;
+                            const cls = (b.className || '').toString().toLowerCase();
+                            if (/\\b(visited|disabled|btn-default|inactive)\\b/.test(cls)) continue;
+                            const txt = ((b.innerText||b.textContent||'')+' '+(b.getAttribute('aria-label')||'')).toLowerCase();
+                            if (/\\b(correction|correct)\\b/.test(cls) || /(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(txt)) return true;
+                        }
+                        return false;
+                    }
+                """))
+                if has_active_corr:
+                    return False
+            except Exception:
+                pass
+            return True
         except Exception:
             return False
 
@@ -603,26 +658,26 @@ class BaseSolver:
                 self.verify_step("กดปุ่มตรวจสอบ [Correction]", False, "ไม่พบปุ่มตรวจสอบ")
                 return False
 
-            deadline = time.time() + 5.0
+            deadline = time.time() + 6.5
             ready = False
             while time.time() < deadline:
                 if self._is_post_correction_ready():
                     ready = True
                     break
-                time.sleep(0.07)
+                time.sleep(0.12)
 
             if not ready:
-                retry_btn = self._locate_action_button("correction", wait_timeout=0.5)
+                retry_btn = self._locate_action_button("correction", wait_timeout=0.6)
                 if retry_btn is not None:
-                    self._safe_click(retry_btn, timeout=2500, description="correction-retry")
-                retry_deadline = time.time() + max(1.5, settle + 1.2)
+                    self._safe_click(retry_btn, timeout=2800, description="correction-retry")
+                retry_deadline = time.time() + max(2.0, settle + 1.5)
                 while time.time() < retry_deadline:
                     if self._is_post_correction_ready():
                         ready = True
                         break
-                    time.sleep(0.07)
+                    time.sleep(0.12)
 
-            time.sleep(0.12)
+            time.sleep(0.35)
             self.verify_step("กดปุ่มตรวจสอบ [Correction]", True, "ตรวจคำตอบแล้ว" if ready else "คลิกแล้ว")
             return True
         except Exception as e:
@@ -676,7 +731,7 @@ class BaseSolver:
                 self.verify_step("รอและกดปุ่มเฉลย [Solution]", False, "ไม่มีปุ่มเฉลยในข้อนี้")
                 return False
 
-            # Wait briefly until solution state updates in DOM
+            # รอให้เฉลยโหลดเสร็จจริง ๆ ช้าลงหน่อยให้แม่น
             self._wait_until_js(
                 """
                 () => {
@@ -695,10 +750,10 @@ class BaseSolver:
                     return false;
                 }
                 """,
-                timeout=max(0.8, settle + 1.2),
-                interval=0.055,
+                timeout=max(1.5, settle + 2.0),
+                interval=0.08,
             )
-            time.sleep(0.08)
+            time.sleep(0.30)
             self.verify_step("รอและกดปุ่มเฉลย [Solution]", True, "แสดงเฉลยพร้อมดึงข้อมูลแล้ว")
             return True
         except Exception as e:
@@ -803,7 +858,7 @@ class BaseSolver:
                 timeout=max(2.0, settle + 2.2),
                 interval=0.05,
             )
-            time.sleep(0.16)
+            time.sleep(0.45)
             if self.has_start_button():
                 self.click_start()
             self.verify_step("กดปุ่มทำซ้ำ [Repeat]", True, "รีเซ็ตหน้าพร้อมกรอกคำตอบแล้ว" if reset_ok else "คลิกแล้ว")
@@ -937,32 +992,41 @@ class BaseSolver:
                         }
                     }
 
-                    const clone = document.body ? document.body.cloneNode(true) : null;
-                    const nonBtnText = (() => {
-                        if (!clone) return '';
-                        clone.querySelectorAll('button, script, style').forEach(el => el.remove());
-                        return (clone.innerText || clone.textContent || '');
-                    })();
-
-                    const resMatch = nonBtnText.match(/(\\d{1,3})\\s*\\/\\s*100\\s*Result/i);
-                    if (resMatch) {
-                        return parseInt(resMatch[1], 10);
-                    }
-
-                    const passPhrases = [
-                        'Very good!', 'Very good', 'Excellent', 'Well done', 'Perfect',
-                        'Great job', 'Good job', 'Nice work', 'Congratulations',
-                        'ดีมาก', 'ยอดเยี่ยม', 'ยอดมาก', 'ทำได้ดีมาก', 'เก่งมาก'
+                    // Only trust pass/fail phrases if they are inside a visible result container, not whole body
+                    const resultContainers = [
+                        '.circliful-and-results',
+                        '.exercise-result-container',
+                        '.exercise-feedback',
+                        '.result-container',
+                        '.feedback-container'
                     ];
-                    const failPhrases = [
-                        'Try again', 'You can do better', 'Not quite', 'Keep trying',
-                        'Have another go', 'ลองอีกครั้ง', 'พยายามอีกครั้ง', 'คุณทำได้ดีกว่านี้'
-                    ];
-                    for (const p of passPhrases) {
-                        if (nonBtnText.includes(p)) return 100;
+                    let scopedText = '';
+                    for (const sel of resultContainers) {
+                        const el = document.querySelector(sel);
+                        if (el && isVis(el)) {
+                            scopedText += ' ' + (el.innerText || el.textContent || '');
+                        }
                     }
-                    for (const f of failPhrases) {
-                        if (nonBtnText.includes(f)) return 0;
+                    if (scopedText) {
+                        const resMatch = scopedText.match(/(\\d{1,3})\\s*\\/\\s*100\\s*Result/i);
+                        if (resMatch) {
+                            return parseInt(resMatch[1], 10);
+                        }
+                        const passPhrases = [
+                            'Very good!', 'Very good', 'Excellent', 'Well done', 'Perfect',
+                            'Great job', 'Good job', 'Nice work', 'Congratulations',
+                            'ดีมาก', 'ยอดเยี่ยม', 'ยอดมาก', 'ทำได้ดีมาก', 'เก่งมาก'
+                        ];
+                        const failPhrases = [
+                            'Try again', 'You can do better', 'Not quite', 'Keep trying',
+                            'Have another go', 'ลองอีกครั้ง', 'พยายามอีกครั้ง', 'คุณทำได้ดีกว่านี้'
+                        ];
+                        for (const p of passPhrases) {
+                            if (scopedText.includes(p)) return 100;
+                        }
+                        for (const f of failPhrases) {
+                            if (scopedText.includes(f)) return 0;
+                        }
                     }
 
                     const bars = Array.from(document.querySelectorAll(".score-bar, .result-bar, [class*='bar-']")).filter(isVis);
@@ -996,9 +1060,10 @@ class BaseSolver:
             if score is not None:
                 return score
             if wait_for_score:
-                deadline = time.time() + 1.5
+                # ช้าลงเพื่อรอ Speexx ตรวจคำตอบให้เสร็จ ไม่รีบอ่านคะแนนจนพลาด
+                deadline = time.time() + 4.0
                 while time.time() < deadline:
-                    time.sleep(0.08)
+                    time.sleep(0.15)
                     score = self._read_score_once_js()
                     if score is not None:
                         return score
@@ -1008,7 +1073,7 @@ class BaseSolver:
 
     def wait_for_page_ready(self):
         try:
-            self.page.wait_for_selector(".exercise, video", state="visible", timeout=10000)
+            self.page.wait_for_selector(".exercise, video", state="visible", timeout=12000)
             self._wait_until_js(
                 """
                 () => Boolean(
@@ -1020,9 +1085,11 @@ class BaseSolver:
                     )
                 )
                 """,
-                timeout=4.0,
-                interval=0.07,
+                timeout=5.0,
+                interval=0.10,
             )
+            # เพิ่ม settle เล็กน้อย ให้ DOM นิ่งก่อนเริ่มทำ
+            time.sleep(0.45)
             return True
         except Exception:
             return False
@@ -1091,9 +1158,9 @@ class BaseSolver:
             ty = target_box["y"] + target_box["height"] / 2
             self.page.mouse.move(sx, sy)
             self.page.mouse.down()
-            time.sleep(0.025)
+            time.sleep(0.06)
             self.page.mouse.move(sx + 5, sy + 5)
-            time.sleep(0.02)
+            time.sleep(0.05)
             self.page.mouse.move((sx + tx) / 2, (sy + ty) / 2)
             time.sleep(0.02)
             self.page.mouse.move(tx, ty)
