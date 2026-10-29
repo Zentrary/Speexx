@@ -225,6 +225,10 @@ class DragDropSolver(BaseSolver):
 
     def _restore_solution(self):
         self.click_correction()
+        if self.get_result_score(wait_for_score=False) >= 100:
+            answers = self._slot_answers()
+            if answers and any(not self._is_empty_answer(a) for a in answers):
+                return answers
 
         ok = self.click_solution()
         if ok:
@@ -446,6 +450,10 @@ class DragDropSolver(BaseSolver):
             )
             self.record_answer("drag-drop", answers, verified=True)
             self.verify_step("บันทึกเฉลย Drag & Drop ลงฐานข้อมูล", True, f"{extracted_count} จุด")
+            if self.get_result_score(wait_for_score=False) >= 100:
+                self.verify_step("ตรวจคะแนน Drag & Drop", True, "ได้คะแนน 100/100")
+                self.logger.info("Drag/drop completed in %s", self.stop_timer())
+                return True
 
             for attempt in range(self.MAX_ITERATIONS):
                 self._fill_slots(answers)

@@ -171,6 +171,10 @@ class SingleChoiceSolver(BaseSolver):
                     self.click_repeat()
 
         self.click_correction()
+        if self.get_result_score(wait_for_score=False) >= 100:
+            self.extract_current_state_answers(verified=True)
+            self.verify_step("ตรวจคะแนน Single Choice", True, "ได้คะแนน 100/100")
+            return True
         has_solution = self.click_solution()
 
         try:

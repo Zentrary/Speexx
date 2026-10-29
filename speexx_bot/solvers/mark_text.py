@@ -55,6 +55,10 @@ class MarkTextSolver(BaseSolver):
                     self.click_repeat()
 
         self.click_correction()
+        if self.get_result_score(wait_for_score=False) >= 100:
+            self.extract_current_state_answers(verified=True)
+            self.verify_step("ตรวจคะแนน Mark Text", True, "ได้คะแนน 100/100")
+            return True
         if not self.click_solution():
             self.report_problem("mark_text_no_solution")
             self.extract_current_state_answers(verified=False)

@@ -533,7 +533,7 @@ class ExerciseRunnerMixin:
 
                 has_verified_solution = (
                     isinstance(solver.last_recorded_answer, dict)
-                    and solver.last_recorded_answer.get("verified") is True
+                    and solver.last_recorded_answer.get("verified", True) is not False
                     and bool(solver.last_recorded_answer.get("answers"))
                 )
                 verified_state = True if (passed_page or has_verified_solution) else False
@@ -561,8 +561,13 @@ class ExerciseRunnerMixin:
                             break
                         else:
                             self._close_modal_keep_staying()
-                    elif idx_pos == len(pages_to_solve) - 1:
-                        self._try_skip_to_next_page()
+                    elif idx_pos == len(pages_to_solve) - 1 or pages_to_solve[idx_pos + 1] == i + 1:
+                        if self._try_skip_to_next_page() and self.detect_completion_modal():
+                            if not effective_force or idx_pos == len(pages_to_solve) - 1:
+                                early_modal_completed = True
+                                break
+                            else:
+                                self._close_modal_keep_staying()
                 else:
                     if i not in captured_page_errors:
                         self.capture_web_error(

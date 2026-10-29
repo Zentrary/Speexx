@@ -206,7 +206,10 @@ class ModalAndPageMixin:
             ) or {}
             if not nav_info.get("found"):
                 return False
-            if nav_info.get("alreadyActive") and num == 1:
+            cur_clean_url = (self.page.url or "").split("?")[0]
+            if nav_info.get("alreadyActive") and (
+                num == 1 or "/exercise/" not in cur_clean_url or cur_clean_url.endswith(f"/exercise/{int(num)}")
+            ):
                 self.wait_for_exercise_content_ready(timeout=6.0)
                 return True
 
@@ -814,19 +817,22 @@ class ModalAndPageMixin:
 
     def _try_skip_to_next_page(self):
         try:
+            prev_url = (self.page.url or "").split("?")[0]
             clicked = self.page.evaluate(
                 """
                 () => {
                     const isVis = (el) => {
-                        if (!el || el.disabled) return false;
+                        if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
                         if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
                         if (el.id === 'nextButton') return false;
+                        const cls = (el.className || '').toString().toLowerCase();
+                        if (/\\b(visited|disabled|inactive)\\b/.test(cls)) return false;
                         const st = window.getComputedStyle(el);
-                        if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+                        if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
                         const r = el.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
                     };
-                    for (const el of document.querySelectorAll('button.action-exercise-button.next')) {
+                    for (const el of document.querySelectorAll('button.action-exercise-button.next, button.nxt-exercise')) {
                         if (isVis(el)) {
                             el.click();
                             return 'button.action-exercise-button.next';
@@ -845,12 +851,18 @@ class ModalAndPageMixin:
                 """
             )
             if clicked:
-                self.logger.info(f"[SKIP] Clicked Next via: {clicked}")
-                time.sleep(0.25)
+                self.logger.info(f"[NEXT] Clicked Next via: {clicked}")
+                wait_end = time.time() + 2.5
+                while time.time() < wait_end:
+                    cur_url = (self.page.url or "").split("?")[0]
+                    if cur_url != prev_url or self.detect_completion_modal():
+                        break
+                    time.sleep(0.06)
+                time.sleep(0.1)
                 return True
             return False
         except Exception as e:
-            self.logger.error(f"[SKIP] Error: {e}")
+            self.logger.error(f"[NEXT] Error: {e}")
             return False
 
     def _parse_elapsed_seconds(self, elapsed):
