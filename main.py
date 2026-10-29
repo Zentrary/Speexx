@@ -165,7 +165,9 @@ TRANSLATIONS = {
         "new_page_not_loaded": "หน้าใหม่ยังไม่โหลด: {}",
         "course_100_stop": "ตรวจพบว่าแบบฝึกหัดครบ 100% แล้ว — หยุดการทำอัตโนมัติเพื่อรอทำแบบทดสอบ",
         "no_more_uncompleted": "ไม่มีแบบฝึกหัดใหม่ที่ยังไม่ผ่านในหน้า Results; จบการทำต่อเนื่อง",
+        "finished_all_in_chapter": "ทำแบบฝึกหัดครบทุกรายการในบทเรียนนี้แล้ว; จบการทำต่อเนื่อง",
         "opening_uncompleted": "เปิดแบบฝึกหัดที่ยังไม่ผ่าน: {}",
+        "opening_next_exercise": "เปิดแบบฝึกหัดถัดไปตามลำดับ: {}",
         "open_next_failed": "เปิดแบบฝึกหัดถัดไปไม่สำเร็จ: {}",
         "opened_no_pages": "เปิด {} แล้ว แต่ยังไม่พบหน้าแบบฝึกหัด",
         "results_return_failed": "กลับหน้า Results เพื่อหาแบบฝึกหัดถัดไปไม่สำเร็จ: {}",
@@ -305,7 +307,9 @@ TRANSLATIONS = {
         "new_page_not_loaded": "Next exercise did not load: {}",
         "course_100_stop": "Course exercises are 100% completed — stopping auto-Continue before test",
         "no_more_uncompleted": "No remaining uncompleted exercises on Results page; finishing auto-Continue",
+        "finished_all_in_chapter": "Finished all exercises in sequence for this chapter; stopping auto-Continue",
         "opening_uncompleted": "Opening uncompleted exercise: {}",
+        "opening_next_exercise": "Opening next exercise in sequence: {}",
         "open_next_failed": "Failed to open next exercise: {}",
         "opened_no_pages": "Opened {} but no exercise pages were found",
         "results_return_failed": "Failed to return to Results page for next exercise: {}",
@@ -979,25 +983,30 @@ class BaseSolver:
                 () => {
                     const isVis = (el) => {
                         if (!el || el.disabled) return false;
+                        if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
                         const st = window.getComputedStyle(el);
-                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                        if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) return false;
                         const r = el.getBoundingClientRect();
                         return r.width > 0 && r.height > 0;
                     };
+                    const inputs = Array.from(document.querySelectorAll('input.answer, input.answer-gap'));
+                    if (inputs.length > 0 && inputs.some(inp => inp.disabled || inp.readOnly)) {
+                        return false;
+                    }
                     for (const b of document.querySelectorAll("button, [role='button']")) {
                         if (!isVis(b)) continue;
                         const cls = (b.className || '').toString().toLowerCase();
                         const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
-                        if (/\\b(correct|start-exercise)\\b/.test(cls)) return true;
+                        if (/\\b(correction|correct|start-exercise)\\b/.test(cls)) return true;
                         if (/(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ|\\bstart\\b|เริ่มต้น)/.test(txt)) return true;
                     }
-                    return !isVis(document.querySelector('.result-badge-text'));
+                    return false;
                 }
                 """,
-                timeout=max(1.2, settle + 1.5),
-                interval=0.055,
+                timeout=max(1.5, settle + 1.8),
+                interval=0.05,
             )
-            time.sleep(0.08)
+            time.sleep(0.12)
             if self.has_start_button():
                 self.click_start()
             self.verify_step("กดปุ่มทำซ้ำ [Repeat]", True, "รีเซ็ตหน้าพร้อมกรอกคำตอบแล้ว" if reset_ok else "คลิกแล้ว")
@@ -1307,7 +1316,9 @@ class DragDropSolver(BaseSolver):
 
     def _slot_answers(self):
         placeholders = self.page.locator(".exercise-items .drag-drop-placeholder").all()
-        tiles = self.page.locator(".exercise-items .drag-drop").all()
+        tiles = self.page.locator(
+            ".exercise-items .drag-drop:not(.draggable-container .drag-drop)"
+        ).all()
         if placeholders and len(placeholders) >= len(tiles) and any(
             ph.locator(".drag-drop").count() > 0 for ph in placeholders
         ):
@@ -1322,7 +1333,7 @@ class DragDropSolver(BaseSolver):
             return out
         if not tiles:
             tiles = self.page.locator(
-                ".exercise-items [data-drag-drop-id]"
+                ".exercise-items [data-drag-drop-id]:not(.draggable-container [data-drag-drop-id])"
             ).all()
         return [self._answer_text(tile.inner_text()) for tile in tiles]
 
@@ -1421,7 +1432,7 @@ class DragDropSolver(BaseSolver):
         placeholders = self.page.locator(".exercise-items .drag-drop-placeholder").all()
         combined = self.page.locator(
             ".exercise-items .drag-drop-placeholder, "
-            ".exercise-items .drag-drop:not(.drag-drop-placeholder .drag-drop)"
+            ".exercise-items .drag-drop:not(.drag-drop-placeholder .drag-drop):not(.draggable-container .drag-drop)"
         ).all()
         if len(combined) > len(placeholders):
             return combined
@@ -1838,47 +1849,55 @@ class AnswerSolver(BaseSolver):
         if expected == 0:
             return
         try:
-            # Fast batch JS fill firing native setter + input/change/blur events for Angular/React
+            self._wait_until_js(
+                """
+                () => {
+                    const inputs = Array.from(document.querySelectorAll('input.answer, input.answer-gap'));
+                    return inputs.length > 0 && inputs.every(inp => !inp.disabled && !inp.readOnly);
+                }
+                """,
+                timeout=1.5,
+                interval=0.04,
+            )
+
+            inputs_loc = self.page.locator(self.ANSWER_INPUT_SELECTOR).all()
+            for i, ans in enumerate(answers):
+                if not ans or i >= len(inputs_loc):
+                    continue
+                try:
+                    inputs_loc[i].fill(ans, timeout=2000)
+                except Exception:
+                    try:
+                        inputs_loc[i].evaluate(
+                            """(inp, val) => {
+                                inp.focus();
+                                inp.value = val;
+                                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                            }""",
+                            ans,
+                        )
+                    except Exception:
+                        pass
+
+            # Trigger AngularJS / jQuery change + blur across all inputs so ngModel commits immediately
             self.page.evaluate(
                 """
-                ([sel, ansList]) => {
-                    const inputs = Array.from(document.querySelectorAll(sel));
-                    const protoSetter = Object.getOwnPropertyDescriptor(
-                        window.HTMLInputElement.prototype, 'value'
-                    )?.set;
-                    ansList.forEach((ans, idx) => {
-                        if (!ans || idx >= inputs.length) return;
-                        const inp = inputs[idx];
+                (sel) => {
+                    document.querySelectorAll(sel).forEach(inp => {
                         try {
-                            inp.focus();
-                            if (protoSetter) protoSetter.call(inp, ans);
-                            else inp.value = ans;
+                            if (window.jQuery) {
+                                window.jQuery(inp).trigger('input').trigger('change').trigger('blur');
+                            }
                             inp.dispatchEvent(new Event('input', { bubbles: true }));
                             inp.dispatchEvent(new Event('change', { bubbles: true }));
-                            inp.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
                             inp.blur();
                         } catch (e) {}
                     });
                 }
                 """,
-                [self.ANSWER_INPUT_SELECTOR, list(answers)],
+                self.ANSWER_INPUT_SELECTOR,
             )
-
-            # Verify every single blank matches; repair any mismatched blank with Playwright .fill()
-            current_vals = self.extract_answers_from_solution()
-            inputs_loc = None
-            for i, ans in enumerate(answers):
-                if not ans:
-                    continue
-                cur = current_vals[i] if i < len(current_vals) else ""
-                if cur != ans:
-                    if inputs_loc is None:
-                        inputs_loc = self.page.locator(self.ANSWER_INPUT_SELECTOR).all()
-                    if i < len(inputs_loc):
-                        try:
-                            inputs_loc[i].fill(ans)
-                        except Exception:
-                            pass
 
             verified_vals = self.extract_answers_from_solution()
             matched = sum(
@@ -4609,7 +4628,7 @@ class _TeeLogHandler(logging.Handler):
             pass
 
 class SpeexxBotCLI:
-    MAX_NEW_EXERCISE_CHAIN = 100
+    MAX_NEW_EXERCISE_CHAIN = 300
     DEFAULT_CHAPTER_NAME = "General"
 
     def __init__(self):
@@ -4624,6 +4643,8 @@ class SpeexxBotCLI:
         self.current_chapter_name = ""
         self.loaded_chapter_name = ""
         self.answer_bank_file = ""
+        self.last_results_url = None
+        self._chapter_live_titles = {}
 
         self.lang = "th"
 
@@ -5665,6 +5686,10 @@ class SpeexxBotCLI:
         self.logger.info(f"Log file: {self.log_filename}")
 
     def _record_web_event(self, kind, detail):
+        if kind == "NAV" and detail:
+            m_art = re.search(r"/articles/(\d+)", str(detail))
+            if m_art:
+                self.last_results_url = f"https://portal.speexx.com/articles/{m_art.group(1)}/results"
         entry = {
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "kind": kind,
@@ -6344,7 +6369,8 @@ class SpeexxBotCLI:
         try:
             m = re.search(r"/articles/(\d+)", self.page.url or "")
             if m:
-                return f"https://portal.speexx.com/articles/{m.group(1)}/results"
+                self.last_results_url = f"https://portal.speexx.com/articles/{m.group(1)}/results"
+                return self.last_results_url
             href = self.page.evaluate("""
                 () => {
                     for (const a of document.querySelectorAll('a[href]')) {
@@ -6358,11 +6384,12 @@ class SpeexxBotCLI:
                     return null;
                 }
             """)
-            if href:
+            if isinstance(href, str) and "/results" in href.lower():
+                self.last_results_url = href
                 return href
         except Exception:
             pass
-        return default
+        return self.last_results_url or default
 
     def _is_exercises_tab_active(self):
         if not self.page:
@@ -6395,7 +6422,7 @@ class SpeexxBotCLI:
     def _click_exercises_tab(self, force=False):
         if not self.page:
             return False
-        if not force and self._is_exercises_tab_active() and self._count_visible_exercise_rows() > 0:
+        if not force and self._count_visible_exercise_rows() > 0:
             return True
         selectors = [
             "#results-table-exercises",
@@ -6503,7 +6530,7 @@ class SpeexxBotCLI:
             self.logger.debug(f"[CHAPTER] inspect failed: {e}")
             return False
 
-        if not state or not state.get("found"):
+        if not isinstance(state, dict) or not state.get("found"):
             self.logger.warning(f"[CHAPTER] Target chapter not found in DOM (cid={target_cid}, name={target_name})")
             return False
 
@@ -6513,10 +6540,20 @@ class SpeexxBotCLI:
             self.current_chapter_name = state["resolvedName"]
 
         was_already_active = bool(state.get("alreadyActive"))
+        prev_first_title = " ".join((state.get("firstRowTitle") or "").split()).strip()
+        known_key = (state.get("resolvedName") or target_name or self.current_chapter_name or "").strip()
+        known_titles = self._chapter_live_titles.get(known_key) or []
+        if not was_already_active and prev_first_title and known_titles:
+            norm_first = prev_first_title.replace("🎧", "").strip().casefold()
+            top_norms = [
+                " ".join(t.replace("🎧", "").split()).strip().casefold()
+                for t in known_titles[:3]
+            ]
+            if norm_first and norm_first in top_norms:
+                was_already_active = True
+
         if not force_click and was_already_active and self._count_visible_exercise_rows() > 0:
             return True
-
-        prev_first_title = state.get("firstRowTitle") or ""
         chapter_box = self.page.locator("[data-speexx-chapter-target='true']").first
         try:
             chapter_box.scroll_into_view_if_needed(timeout=3000)
@@ -6579,7 +6616,7 @@ class SpeexxBotCLI:
         if not self.page:
             return False
         if "/results" not in (self.page.url or "").lower():
-            if not self.navigate_to_results():
+            if not self.navigate_to_results(interactive=False):
                 return False
             force_chapter_click = False
 
@@ -6598,18 +6635,31 @@ class SpeexxBotCLI:
         return True
 
     def check_course_progress(self):
+        if getattr(self, "force_solve_all", False):
+            return False
         try:
-            if "/results" in self.page.url.lower():
+            if "/results" in (self.page.url or "").lower():
                 info_title = self.page.locator(".progress-info .info-title").first
                 if info_title.count() > 0:
                     text = info_title.inner_text().strip()
                     if re.search(r"\b100\s*%", text):
                         return True
+                return False
 
-            self.page.goto("https://portal.speexx.com/", wait_until="domcontentloaded", timeout=20000)
-            time.sleep(1.5)
-            if self._click_progress_nav():
-                time.sleep(1.5)
+            direct_url = self._discover_results_url()
+            if direct_url:
+                self.page.goto(direct_url, wait_until="domcontentloaded", timeout=20000)
+                try:
+                    self.page.locator(".level-container, .progress-info").first.wait_for(
+                        state="visible", timeout=8000
+                    )
+                except Exception:
+                    pass
+            else:
+                self.page.goto("https://portal.speexx.com/", wait_until="domcontentloaded", timeout=20000)
+                time.sleep(1.0)
+                if self._click_progress_nav():
+                    time.sleep(1.0)
 
             info_title = self.page.locator(".progress-info .info-title").first
             if info_title.count() > 0:
@@ -6621,17 +6671,62 @@ class SpeexxBotCLI:
             self.logger.error(f"[PROGRESS] Error checking status: {e}")
             return False
 
-    def navigate_to_results(self):
+    def navigate_to_results(self, interactive=True):
         if not self.page:
             self.print_status("ERROR", "Browser not started.")
-            self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+            if interactive:
+                self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
             return False
-        self.print_status("INFO", "Navigating to Dashboard -> Progress -> Exercises...")
+
+        # If ALREADY on /results, stay right here without bouncing to Dashboard!
+        if "/results" in (self.page.url or "").lower():
+            try:
+                self._discover_results_url()
+                self.page.locator(".level-container").first.wait_for(state="visible", timeout=8000)
+                if self.current_chapter_cid or (
+                    self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
+                ):
+                    self._activate_chapter_on_results(
+                        self.current_chapter_cid,
+                        self.current_chapter_name,
+                        force_click=False,
+                    )
+                self._click_exercises_tab(force=False)
+                self._wait_for_visible_exercise_rows(timeout_ms=6000)
+                self._ensure_chapter_db_loaded(announce=False)
+                return True
+            except Exception as stay_err:
+                self.logger.debug(f"[NAV] In-place /results check fallback: {stay_err}")
+
         discovered_before = self._discover_results_url()
+        # Fast direct navigation to /results if we already know the article's /results URL!
+        if discovered_before:
+            try:
+                self.page.goto(discovered_before, wait_until="domcontentloaded", timeout=20000)
+                self.page.locator(".level-container").first.wait_for(
+                    state="visible", timeout=12000
+                )
+                if self.current_chapter_cid or (
+                    self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
+                ):
+                    self._activate_chapter_on_results(
+                        self.current_chapter_cid,
+                        self.current_chapter_name,
+                        force_click=False,
+                    )
+                self._click_exercises_tab(force=False)
+                self._wait_for_visible_exercise_rows(timeout_ms=8000)
+                self._ensure_chapter_db_loaded(announce=False)
+                self.print_status("OK", "Results loaded.")
+                return True
+            except Exception as direct_err:
+                self.logger.debug(f"[NAV] Direct /results failed ({direct_err}); trying Dashboard -> Progress")
+
+        self.print_status("INFO", "Navigating to Dashboard -> Progress -> Exercises...")
         fallback_url = discovered_before or "https://portal.speexx.com/articles/10960433/results"
         try:
             self.page.goto("https://portal.speexx.com/", wait_until="domcontentloaded", timeout=20000)
-            time.sleep(1.5)
+            time.sleep(1.2)
             fallback_url = (
                 self._discover_results_url()
                 or discovered_before
@@ -6639,12 +6734,13 @@ class SpeexxBotCLI:
             )
 
             if self._click_progress_nav():
-                time.sleep(2)
+                time.sleep(1.5)
             else:
                 self.logger.warning("[NAV] Progress button not found, falling back to direct URL")
                 raise Exception("Progress button not found")
 
             self.page.locator(".level-container").first.wait_for(state="visible", timeout=15000)
+            self._discover_results_url()
 
             if self.current_chapter_cid or (
                 self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
@@ -6683,7 +6779,8 @@ class SpeexxBotCLI:
                 return True
             except Exception as e2:
                 self.print_status("ERROR", f"Failed to navigate: {str(e2)}")
-                self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
+                if interactive:
+                    self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
                 return False
 
     @staticmethod
@@ -6865,6 +6962,102 @@ class SpeexxBotCLI:
             self.logger.debug(f"[ROW] inspect failed: {e}")
         return info
 
+    def _inspect_all_visible_result_rows(self):
+        if not self.page:
+            return []
+        try:
+            raw_list = self.page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    let visIdx = 0;
+                    const rows = document.querySelectorAll('tbody tr.clickable');
+                    for (const row of rows) {
+                        const st = window.getComputedStyle(row);
+                        if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) {
+                            continue;
+                        }
+                        const rect = row.getBoundingClientRect();
+                        if (rect.width <= 0 || rect.height <= 0) continue;
+
+                        const tds = row.querySelectorAll('td');
+                        if (tds.length < 4) {
+                            visIdx++;
+                            continue;
+                        }
+                        const clean = (el) => (el ? (el.innerText || el.textContent || '') : '').replace(/\\s+/g, ' ').trim();
+                        const title = clean(tds[0]);
+                        const date = clean(tds[1]);
+                        const timeSpent = clean(tds[2]);
+                        const scoreText = clean(tds[3]);
+                        let review = '';
+                        if (tds.length >= 5) {
+                            const btn = tds[4].querySelector('button');
+                            review = btn ? clean(btn) : clean(tds[4]);
+                        }
+                        const m = scoreText.match(/\\d+/);
+                        const score = m ? parseInt(m[0], 10) : null;
+
+                        let hasCheckmark = false;
+                        const cell = tds[3];
+                        const html = (cell.innerHTML || '').toLowerCase();
+                        if (/[✓✔☑]/.test(scoreText)) {
+                            hasCheckmark = true;
+                        } else {
+                            let bad = false;
+                            let passIcon = false;
+                            const nodes = [cell, ...cell.querySelectorAll('i, svg, span, img, div')];
+                            for (const n of nodes) {
+                                const cls = (n.className && n.className.baseVal !== undefined
+                                    ? n.className.baseVal : (n.className || '')).toString().toLowerCase();
+                                const aria = (n.getAttribute && (n.getAttribute('aria-label') || '') || '').toLowerCase();
+                                const combined = cls + ' ' + aria;
+                                if (/(times|cross|wrong|error|fail|red|close)/.test(combined)) {
+                                    bad = true;
+                                    break;
+                                }
+                                if (/(check|tick|success|passed|complete|result-green|green)/.test(combined)) {
+                                    passIcon = true;
+                                }
+                            }
+                            if (!bad && (passIcon || (cell.querySelector('svg') && !html.includes('cross') && !html.includes('error')))) {
+                                hasCheckmark = true;
+                            }
+                        }
+
+                        const isCompleted = score !== null ? (score >= 51) : hasCheckmark;
+                        out.push({
+                            row_index: visIdx,
+                            title,
+                            date,
+                            time_spent: timeSpent,
+                            score_text: scoreText,
+                            score,
+                            has_checkmark: hasCheckmark,
+                            is_completed: isCompleted,
+                            review
+                        });
+                        visIdx++;
+                    }
+                    return out;
+                }
+                """
+            ) or []
+            if self.current_chapter_name and raw_list:
+                self._chapter_live_titles[self.current_chapter_name] = [
+                    r["title"] for r in raw_list if r.get("title")
+                ]
+            return raw_list
+        except Exception as e:
+            self.logger.debug(f"[ROW] batch inspect fallback: {e}")
+            rows = self._get_visible_exercise_rows()
+            res = [self._inspect_result_row(r, row_index=idx) for idx, r in enumerate(rows)]
+            if self.current_chapter_name and res:
+                self._chapter_live_titles[self.current_chapter_name] = [
+                    r["title"] for r in res if r.get("title")
+                ]
+            return res
+
     def fetch_exercises(self, _already_prepared=False):
         self.print_header()
         print(f"  {Fore.CYAN}--- {self.T['exercise_list']} ---{Style.RESET_ALL}\n")
@@ -6879,8 +7072,8 @@ class SpeexxBotCLI:
                 self._wait_for_visible_exercise_rows(timeout_ms=15000)
                 self._ensure_all_exercises_visible()
 
-            rows = self._get_visible_exercise_rows()
-            if not rows:
+            row_infos = self._inspect_all_visible_result_rows()
+            if not row_infos:
                 self.print_status("ERROR", self.T['no_exercises'])
                 self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
                 return
@@ -6898,8 +7091,8 @@ class SpeexxBotCLI:
             print(f"  {Fore.CYAN}{'-' * 96}{Style.RESET_ALL}")
 
             exercises = []
-            for row_idx, row in enumerate(rows):
-                r_info = self._inspect_result_row(row, row_index=row_idx)
+            for r_info in row_infos:
+                row_idx = r_info["row_index"]
                 if not r_info["title"] and r_info["score_text"] == "" and not r_info["date"]:
                     continue
                 i = len(exercises) + 1
@@ -7382,10 +7575,31 @@ class SpeexxBotCLI:
         except Exception:
             return False
 
+    @staticmethod
+    def _norm_ex_title(text):
+        cleaned = (text or "").replace("🎧", "")
+        cleaned = re.sub(r"^[·•\-–—]+\s*", "", cleaned.strip())
+        return " ".join(cleaned.split()).strip().casefold()
+
+    @staticmethod
+    def _extract_packet_key(url):
+        if not url:
+            return ""
+        clean = str(url).split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        m = re.search(r"((?:standard|classroom|video|audio|test|custom)?-?packet/\d+|/packets?/\d+)", clean, re.I)
+        if m:
+            return m.group(1).strip("/").lower()
+        clean = re.sub(r"/exercise/\d+$", "", clean, flags=re.I)
+        if "/results" in clean.lower():
+            return ""
+        return clean.lower()
+
     def wait_for_completion_modal(self, timeout=15):
         deadline = time.time() + float(timeout)
         start_t = time.time()
         while time.time() < deadline:
+            if "/results" in (self.page.url or "").lower():
+                return False
             if self.detect_completion_modal():
                 elapsed = time.time() - start_t
                 self.print_status("OK", f"Completion modal detected (after {elapsed:.1f}s)")
@@ -8067,7 +8281,8 @@ class SpeexxBotCLI:
                             is_continuation=False, already_opened=False,
                             total_pages=None, batch_mode=False,
                             auto_continue=False, continuation_depth=0,
-                            chain_seen_titles=None, row_index=None):
+                            chain_seen_titles=None, row_index=None,
+                            chain_direction=None):
         self._ensure_chapter_db_loaded(announce=False)
 
         if not is_continuation and not batch_mode:
@@ -8078,10 +8293,16 @@ class SpeexxBotCLI:
         final_score = 0
         final_elapsed = "N/A"
         pages_recorded_count = 0
+        exercise_db_saved = False
         if auto_continue:
             if chain_seen_titles is None:
                 chain_seen_titles = set()
-            chain_seen_titles.add((title or "").strip().casefold())
+            norm_init_title = self._norm_ex_title(title)
+            if norm_init_title and norm_init_title != "unknown":
+                if row_index is not None:
+                    chain_seen_titles.add(f"row:{norm_init_title}#{row_index}")
+                else:
+                    chain_seen_titles.add(f"title:{norm_init_title}")
 
         try:
             if not already_opened and not is_continuation:
@@ -8127,6 +8348,17 @@ class SpeexxBotCLI:
                 detected_title = self.get_current_exercise_title()
                 if detected_title and detected_title != "Unknown":
                     title = detected_title
+
+            if auto_continue and chain_seen_titles is not None:
+                cur_pkt = self._extract_packet_key(self.page.url)
+                if cur_pkt:
+                    chain_seen_titles.add(f"pkt:{cur_pkt}")
+                norm_resolved = self._norm_ex_title(title)
+                if norm_resolved and norm_resolved != "unknown":
+                    if row_index is not None:
+                        chain_seen_titles.add(f"row:{norm_resolved}#{row_index}")
+                    else:
+                        chain_seen_titles.add(f"title:{norm_resolved}")
 
             if total_pages is None:
                 total_pages = self.get_total_exercises(retries=3, wait_seconds=0.6)
@@ -8488,6 +8720,7 @@ class SpeexxBotCLI:
             final_elapsed = f"{total_secs:.2f}s"
 
             self._save_answer_db(self.current_chapter_name)
+            exercise_db_saved = True
             self.print_status(
                 "DB",
                 self.T["db_saved_exercise"].format(
@@ -8536,7 +8769,8 @@ class SpeexxBotCLI:
                         pass
 
                 previous_url = self.page.url
-                previous_title = self.get_current_exercise_title()
+                previous_pkt = self._extract_packet_key(previous_url)
+                previous_title = title if (title and title != "Unknown") else self.get_current_exercise_title()
                 if auto_continue:
                     if continuation_depth >= self.MAX_NEW_EXERCISE_CHAIN:
                         self.print_status(
@@ -8558,10 +8792,11 @@ class SpeexxBotCLI:
                         title, selected_pages=None,
                         is_continuation=True, already_opened=True,
                         total_pages=total_pages,
+                        row_index=row_index,
+                        chain_direction=chain_direction,
                     )
                 elif action == "continue":
                     self.print_status("OK", "Moving on (Continue)...")
-                    time.sleep(0.6)
                     try:
                         if auto_continue:
                             self.page.wait_for_function(
@@ -8583,39 +8818,106 @@ class SpeexxBotCLI:
                                 arg={"url": previous_url, "title": previous_title},
                                 timeout=12000,
                             )
-                            if "/results" in self.page.url.lower():
+                            if "/results" in (self.page.url or "").lower():
                                 self.logger.info("[VERIFY] [OK] เปลี่ยนกลับหน้า /results เพื่อเลือกแบบฝึกหัดถัดไป")
                                 return self._continue_auto_from_results(
                                     title, final_status, final_score,
                                     final_elapsed, chain_seen_titles,
                                     continuation_depth,
+                                    current_row_index=row_index,
+                                    chain_direction=chain_direction,
                                 )
+
                         self.page.wait_for_selector(
                             ".exercise, .video",
                             state="visible",
                             timeout=10000
                         )
+
+                        # Wait for the new exercise's packet route & header title to finish settling
+                        settle_deadline = time.time() + 4.0
+                        while time.time() < settle_deadline:
+                            if "/results" in (self.page.url or "").lower():
+                                break
+                            cand_pkt = self._extract_packet_key(self.page.url)
+                            cand_title = self.get_current_exercise_title()
+                            pkt_changed = bool(cand_pkt and cand_pkt != previous_pkt)
+                            title_ready = bool(cand_title and cand_title != "Unknown" and cand_title != previous_title)
+                            if pkt_changed and title_ready:
+                                break
+                            time.sleep(0.15)
+
+                        if "/results" in (self.page.url or "").lower():
+                            return self._continue_auto_from_results(
+                                title, final_status, final_score,
+                                final_elapsed, chain_seen_titles,
+                                continuation_depth,
+                                current_row_index=row_index,
+                                chain_direction=chain_direction,
+                            )
+
                         new_total = self.get_total_exercises(
-                            retries=2 if auto_continue else 3,
-                            wait_seconds=0.5 if auto_continue else 1.0,
+                            retries=3,
+                            wait_seconds=0.5,
                         )
                         new_title = self.get_current_exercise_title()
+                        new_pkt = self._extract_packet_key(self.page.url)
+
                         if auto_continue and new_total == 0:
                             return self._continue_auto_from_results(
                                 title, final_status, final_score,
                                 final_elapsed, chain_seen_titles,
                                 continuation_depth,
+                                current_row_index=row_index,
+                                chain_direction=chain_direction,
                             )
-                        if (auto_continue and self.page.url == previous_url and
+                        if (auto_continue and new_pkt == previous_pkt and
                                 new_title == previous_title):
                             self.logger.warning("[CONTINUE] Still on same exercise after Continue; falling back to /results")
                             return self._continue_auto_from_results(
                                 title, final_status, final_score,
                                 final_elapsed, chain_seen_titles,
                                 continuation_depth,
+                                current_row_index=row_index,
+                                chain_direction=chain_direction,
                             )
 
-                        if auto_continue and new_title.casefold() in chain_seen_titles:
+                        known_titles = self._chapter_live_titles.get(self.current_chapter_name) or []
+                        next_row_idx = None
+                        if auto_continue and self.force_solve_all and row_index is not None and known_titles:
+                            expected_idx = (
+                                row_index + 1 if chain_direction == "down" else row_index - 1
+                            )
+                            if 0 <= expected_idx < len(known_titles):
+                                expected_title = known_titles[expected_idx]
+                                if (
+                                    expected_title
+                                    and new_title
+                                    and new_title != "Unknown"
+                                    and self._norm_ex_title(new_title)
+                                    != self._norm_ex_title(expected_title)
+                                ):
+                                    self.logger.info(
+                                        f"[CONTINUE] Speexx ข้ามไปที่ '{new_title}' — "
+                                        f"เปิดแบบฝึกหัดถัดไปตามลำดับ '{expected_title}' แทน"
+                                    )
+                                    return self._continue_auto_from_results(
+                                        title, final_status, final_score,
+                                        final_elapsed, chain_seen_titles,
+                                        continuation_depth,
+                                        current_row_index=row_index,
+                                        chain_direction=chain_direction,
+                                    )
+                                next_row_idx = expected_idx
+
+                        if next_row_idx is None and known_titles and new_title and new_title != "Unknown":
+                            nt_norm = self._norm_ex_title(new_title)
+                            for k_idx, kt in enumerate(known_titles):
+                                if self._norm_ex_title(kt) == nt_norm:
+                                    next_row_idx = k_idx
+                                    break
+
+                        if auto_continue and new_pkt and f"pkt:{new_pkt}" in (chain_seen_titles or set()):
                             self.print_status("OK", self.T["stop_loop_detected"])
                             return (final_status, final_score, final_elapsed)
 
@@ -8630,6 +8932,8 @@ class SpeexxBotCLI:
                             auto_continue=auto_continue,
                             continuation_depth=continuation_depth + 1,
                             chain_seen_titles=chain_seen_titles,
+                            row_index=next_row_idx,
+                            chain_direction=chain_direction,
                         )
                     except Exception as e:
                         if auto_continue:
@@ -8641,6 +8945,8 @@ class SpeexxBotCLI:
                                 title, final_status, final_score,
                                 final_elapsed, chain_seen_titles,
                                 continuation_depth,
+                                current_row_index=row_index,
+                                chain_direction=chain_direction,
                             )
                         self.print_status("WAIT", self.T["new_page_not_loaded"].format(e))
                         return (final_status, final_score, final_elapsed)
@@ -8650,6 +8956,8 @@ class SpeexxBotCLI:
                             title, final_status, final_score,
                             final_elapsed, chain_seen_titles,
                             continuation_depth,
+                            current_row_index=row_index,
+                            chain_direction=chain_direction,
                         )
                     return (final_status, final_score, final_elapsed)
             else:
@@ -8664,6 +8972,8 @@ class SpeexxBotCLI:
                         title, final_status, final_score,
                         final_elapsed, chain_seen_titles,
                         continuation_depth,
+                        current_row_index=row_index,
+                        chain_direction=chain_direction,
                     )
                 return (final_status, final_score, final_elapsed)
 
@@ -8676,7 +8986,7 @@ class SpeexxBotCLI:
             )
         finally:
             try:
-                if pages_recorded_count > 0 or self.answer_db or self.structured_page_records:
+                if not exercise_db_saved and (pages_recorded_count > 0 or self.answer_db or self.structured_page_records):
                     self._save_answer_db(self.current_chapter_name)
             except Exception as save_err:
                 self.logger.error(f"[DB] Final save error: {save_err}")
@@ -8688,51 +8998,107 @@ class SpeexxBotCLI:
 
         return (final_status, final_score, final_elapsed)
 
-    def _next_uncompleted_exercise_entry(self, current_title, rows, seen_titles):
-        exercises = []
-        for r_idx, row in enumerate(rows):
-            info = self._inspect_result_row(row, row_index=r_idx)
-            if not info["title"]:
-                continue
-            exercises.append(info)
+    def _next_uncompleted_exercise_entry(
+        self,
+        current_title,
+        rows=None,
+        seen_titles=None,
+        current_row_index=None,
+        chain_direction=None,
+    ):
+        if seen_titles is None:
+            seen_titles = set()
 
+        exercises = [
+            info for info in self._inspect_all_visible_result_rows()
+            if info.get("title")
+        ]
         if not exercises:
-            return None, None
+            return None, None, chain_direction
 
-        current_key = (current_title or "").strip().casefold()
-        current_index = next(
-            (index for index, item in enumerate(exercises)
-             if item["title"].casefold() == current_key),
-            -1,
-        )
-        indexes = list(range(current_index + 1, len(exercises)))
-        indexes.extend(range(0, current_index + 1))
+        current_key = self._norm_ex_title(current_title)
+        current_index = -1
+
+        if current_row_index is not None and 0 <= current_row_index < len(exercises):
+            if self._norm_ex_title(exercises[current_row_index]["title"]) == current_key:
+                current_index = current_row_index
+
+        if current_index < 0 and current_key:
+            matching_indices = [
+                idx for idx, item in enumerate(exercises)
+                if self._norm_ex_title(item["title"]) == current_key
+            ]
+            if matching_indices:
+                if current_row_index is not None:
+                    current_index = min(matching_indices, key=lambda x: abs(x - current_row_index))
+                else:
+                    current_index = matching_indices[0]
+
+        resolved_direction = chain_direction
+        # Speexx /results lists exercises newest-at-top [1] (index 0) and Lesson 1.1 at-bottom [N] (index N-1).
+        # Chronological learning order is UPWARD: index - 1 -> index - 2 -> ... -> 0!
+        if resolved_direction == "down":
+            start_i = current_index + 1 if current_index >= 0 else 0
+            indexes = list(range(start_i, len(exercises)))
+        else:
+            if current_index > 0:
+                resolved_direction = "up"
+                indexes = list(range(current_index - 1, -1, -1))
+                if not self.force_solve_all:
+                    indexes.extend(range(len(exercises) - 1, current_index, -1))
+            elif current_index == 0:
+                if self.force_solve_all:
+                    # Started at [1] (topmost row) in Force mode with no new exercise above it: step [2]..[N]
+                    resolved_direction = "down"
+                    indexes = list(range(1, len(exercises)))
+                else:
+                    resolved_direction = "up"
+                    indexes = list(range(len(exercises) - 1, 0, -1))
+            else:
+                resolved_direction = "up"
+                indexes = list(range(len(exercises) - 1, -1, -1))
+
         for index in indexes:
             item = exercises[index]
             name = item["title"]
-            row_key = f"{name.casefold()}#{item['row_index']}"
             if not name:
                 continue
-            if item["is_completed"]:
+            r_idx = item["row_index"]
+            norm_name = self._norm_ex_title(name)
+            row_key = f"row:{norm_name}#{r_idx}"
+            title_key = f"title:{norm_name}"
+
+            if not self.force_solve_all and item["is_completed"]:
                 continue
-            if row_key in seen_titles:
+            if row_key in seen_titles or norm_name in seen_titles:
                 continue
-            if name.casefold() in seen_titles and sum(
-                1 for x in exercises if x["title"].casefold() == name.casefold() and not x["is_completed"]
-            ) == 0:
+            if title_key in seen_titles and sum(
+                1 for x in exercises if self._norm_ex_title(x["title"]) == norm_name
+            ) <= 1:
                 continue
+
             seen_titles.add(row_key)
-            return name, item["row_index"]
-        return None, None
+            return name, r_idx, resolved_direction
+
+        return None, None, resolved_direction
 
     def _next_uncompleted_exercise_title(self, current_title, rows, seen_titles):
-        name, _ = self._next_uncompleted_exercise_entry(current_title, rows, seen_titles)
+        name, _, _ = self._next_uncompleted_exercise_entry(current_title, rows, seen_titles)
         return name
 
-    def _continue_auto_from_results(self, current_title, status, score, elapsed,
-                                    seen_titles, continuation_depth):
+    def _continue_auto_from_results(
+        self,
+        current_title,
+        status,
+        score,
+        elapsed,
+        seen_titles,
+        continuation_depth,
+        current_row_index=None,
+        chain_direction=None,
+    ):
         try:
-            if self.check_course_progress():
+            if not self.force_solve_all and self.check_course_progress():
                 self.print_status("OK", self.T["course_100_stop"])
                 return (status, score, elapsed)
 
@@ -8740,24 +9106,29 @@ class SpeexxBotCLI:
                 force_chapter_click=False,
                 wait_timeout=15000,
             )
-            rows = self._get_visible_exercise_rows()
             if seen_titles is None:
                 seen_titles = set()
-            next_title, next_row_idx = self._next_uncompleted_exercise_entry(
-                current_title, rows, seen_titles
+            next_title, next_row_idx, next_dir = self._next_uncompleted_exercise_entry(
+                current_title,
+                rows=None,
+                seen_titles=seen_titles,
+                current_row_index=current_row_index,
+                chain_direction=chain_direction,
             )
             if not next_title:
-                self.print_status("OK", self.T["no_more_uncompleted"])
+                stop_key = "finished_all_in_chapter" if self.force_solve_all else "no_more_uncompleted"
+                self.print_status("OK", self.T[stop_key])
                 return (status, score, elapsed)
 
-            self.print_status("INFO", self.T["opening_uncompleted"].format(next_title))
+            msg_key = "opening_next_exercise" if self.force_solve_all else "opening_uncompleted"
+            self.print_status("INFO", self.T[msg_key].format(next_title))
             if not self._click_row_safely(next_title, row_index=next_row_idx):
                 self.print_status("ERROR", self.T["open_next_failed"].format(next_title))
                 return (status, score, elapsed)
             self.page.wait_for_selector(
                 ".exercise, .video", state="visible", timeout=15000
             )
-            next_total = self.get_total_exercises(retries=2, wait_seconds=0.75)
+            next_total = self.get_total_exercises(retries=3, wait_seconds=0.5)
             if next_total == 0:
                 if self.page.locator(".exercise, .video").count() > 0:
                     next_total = 1
@@ -8773,6 +9144,8 @@ class SpeexxBotCLI:
                 auto_continue=True,
                 continuation_depth=continuation_depth + 1,
                 chain_seen_titles=seen_titles,
+                row_index=next_row_idx,
+                chain_direction=next_dir,
             )
         except Exception as e:
             self.print_status("WAIT", self.T["results_return_failed"].format(e))
@@ -8783,11 +9156,14 @@ class SpeexxBotCLI:
         if not rows:
             return None
 
-        target_norm = " ".join((title or "").split()).strip().casefold()
+        infos = self._inspect_all_visible_result_rows()
+        if not infos:
+            return None
 
-        if row_index is not None and 0 <= row_index < len(rows):
-            r_info = self._inspect_result_row(rows[row_index], row_index=row_index)
-            row_title_norm = r_info["title"].casefold()
+        target_norm = self._norm_ex_title(title)
+
+        if row_index is not None and 0 <= row_index < min(len(rows), len(infos)):
+            row_title_norm = self._norm_ex_title(infos[row_index].get("title") or "")
             if not target_norm or row_title_norm == target_norm:
                 return rows[row_index]
 
@@ -8796,54 +9172,74 @@ class SpeexxBotCLI:
 
         exact_matches = []
         partial_matches = []
-        for idx, row in enumerate(rows):
-            r_info = self._inspect_result_row(row, row_index=idx)
-            row_title_norm = r_info["title"].casefold()
+        limit = min(len(rows), len(infos))
+        for idx in range(limit):
+            r_info = infos[idx]
+            row_title_norm = self._norm_ex_title(r_info.get("title") or "")
+            if not row_title_norm:
+                continue
             if row_title_norm == target_norm:
-                exact_matches.append((row, r_info))
-            elif target_norm in row_title_norm or (row_title_norm and row_title_norm in target_norm):
-                partial_matches.append((row, r_info))
+                exact_matches.append((idx, rows[idx], r_info))
+            elif target_norm in row_title_norm or row_title_norm in target_norm:
+                partial_matches.append((idx, rows[idx], r_info))
 
         if exact_matches:
+            if row_index is not None:
+                best = min(exact_matches, key=lambda x: abs(x[0] - row_index))
+                return best[1]
             if len(exact_matches) > 1 and not self.force_solve_all:
-                for row, r_info in exact_matches:
+                for _, row, r_info in exact_matches:
                     if not r_info["is_completed"]:
                         return row
-            return exact_matches[0][0]
+            return exact_matches[0][1]
 
         if partial_matches:
+            if row_index is not None:
+                best = min(partial_matches, key=lambda x: abs(x[0] - row_index))
+                return best[1]
             if len(partial_matches) > 1 and not self.force_solve_all:
-                for row, r_info in partial_matches:
+                for _, row, r_info in partial_matches:
                     if not r_info["is_completed"]:
                         return row
-            return partial_matches[0][0]
+            return partial_matches[0][1]
 
         return None
 
     def _click_row_safely(self, title, wait_timeout=15000, row_index=None, click_inner_cell=False):
-        try:
-            url_low = (self.page.url or "").lower()
-            if "/results" not in url_low or self._count_visible_exercise_rows() == 0:
-                self.logger.info("[CLICK] Exercise table empty or off /results — recovering chapter & Exercises view")
-                self._ensure_results_chapter_and_exercises_ready(
-                    force_chapter_click=False,
-                    wait_timeout=min(wait_timeout, 12000),
-                )
-            else:
-                if self.current_chapter_cid or (
-                    self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
-                ):
-                    self._activate_chapter_on_results(
-                        self.current_chapter_cid,
-                        self.current_chapter_name,
-                        force_click=False,
-                    )
-                self._click_exercises_tab(force=False)
-                self._ensure_all_exercises_visible()
-        except Exception as e:
-            self.logger.debug(f"[CLICK] Table recovery check error: {e}")
+        row = None
+        url_low = (self.page.url or "").lower()
 
-        row = self._find_matching_exercise_row(title, row_index=row_index)
+        # Fast path: if already on /results with visible rows, inspect once and click immediately
+        if "/results" in url_low:
+            try:
+                row = self._find_matching_exercise_row(title, row_index=row_index)
+            except Exception as e:
+                self.logger.debug(f"[CLICK] Fast-path row lookup error: {e}")
+
+        if row is None:
+            try:
+                if "/results" not in url_low or self._count_visible_exercise_rows() == 0:
+                    self.logger.info("[CLICK] Exercise table empty or off /results — recovering chapter & Exercises view")
+                    self._ensure_results_chapter_and_exercises_ready(
+                        force_chapter_click=False,
+                        wait_timeout=min(wait_timeout, 12000),
+                    )
+                else:
+                    if self.current_chapter_cid or (
+                        self.current_chapter_name and self.current_chapter_name != self.DEFAULT_CHAPTER_NAME
+                    ):
+                        self._activate_chapter_on_results(
+                            self.current_chapter_cid,
+                            self.current_chapter_name,
+                            force_click=False,
+                        )
+                    self._click_exercises_tab(force=False)
+                    self._ensure_all_exercises_visible()
+            except Exception as e:
+                self.logger.debug(f"[CLICK] Table recovery check error: {e}")
+
+            row = self._find_matching_exercise_row(title, row_index=row_index)
+
         if row is None:
             self.logger.info(
                 f"[CLICK] '{title}' not in current visible rows — forcing chapter re-select & Show more expansion"
@@ -8870,11 +9266,11 @@ class SpeexxBotCLI:
             )
             return False
 
-        time.sleep(0.25)
+        time.sleep(0.15)
 
         try:
             row.scroll_into_view_if_needed(timeout=3000)
-            time.sleep(0.25)
+            time.sleep(0.15)
         except Exception as e:
             self.logger.debug(f"[CLICK] scroll_into_view failed: {e}")
             try:
