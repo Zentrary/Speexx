@@ -32,9 +32,9 @@ except ImportError:
     Fore = _DummyColor()
     Style = _DummyColor()
 
-ACTION_SETTLE_SECONDS = 1.15
-EXERCISE_STEP_PAUSE_SECONDS = 0.65
-FAST_ACTION_SETTLE_SECONDS = 0.25
+ACTION_SETTLE_SECONDS = 0.25
+EXERCISE_STEP_PAUSE_SECONDS = 0.15
+FAST_ACTION_SETTLE_SECONDS = 0.10
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -370,11 +370,12 @@ UNSUPPORTED_TYPES = {
 class BaseSolver:
     PASS_LINE = 51
 
-    def __init__(self, page, logger, answer_db=None, page_answer_index=None):
+    def __init__(self, page, logger, answer_db=None, page_answer_index=None, diagnostic_cb=None):
         self.page = page
         self.logger = logger
         self.answer_db = answer_db if answer_db is not None else {}
         self.page_answer_index = page_answer_index if page_answer_index is not None else {}
+        self.diagnostic_cb = diagnostic_cb
         self.exercise_title = ""
         self.page_number = 0
         self.start_time = None
@@ -405,6 +406,49 @@ class BaseSolver:
     def step(self, msg):
         print(f"    >> {msg}")
         self.logger.info(f"STEP: {msg}")
+
+    def verify_step(self, step_name, ok, detail=""):
+        suffix = f" ({detail})" if detail else ""
+        if ok:
+            print(f"    {Fore.GREEN}[CHECK OK]{Style.RESET_ALL} {step_name}{suffix}")
+            self.logger.info(f"[CHECK OK] {step_name}{suffix}")
+        else:
+            print(f"    {Fore.YELLOW}[CHECK !!]{Style.RESET_ALL} {step_name}{suffix}")
+            self.logger.warning(f"[CHECK FAIL] {step_name}{suffix}")
+        return ok
+
+    def report_problem(self, reason, extra=None):
+        self.logger.warning(f"[PROBLEM] {reason} | extra={extra}")
+        if callable(self.diagnostic_cb):
+            try:
+                self.diagnostic_cb(
+                    reason,
+                    exercise_title=self.exercise_title,
+                    page_number=self.page_number,
+                    solver_name=self.__class__.__name__,
+                    extra=extra,
+                )
+            except Exception as e:
+                self.logger.debug(f"[PROBLEM] diagnostic_cb error: {e}")
+
+    def _wait_until_js(self, js_fn, arg=None, timeout=4.0, interval=0.055):
+        deadline = time.time() + max(0.05, float(timeout))
+        last_val = None
+        while True:
+            try:
+                last_val = (
+                    self.page.evaluate(js_fn)
+                    if arg is None
+                    else self.page.evaluate(js_fn, arg)
+                )
+                if last_val:
+                    return last_val
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                break
+            time.sleep(interval)
+        return last_val
 
     def _normalise_question_text(self, text):
         if text is None:
@@ -639,16 +683,127 @@ class BaseSolver:
                 continue
         return False
 
+    def _locate_action_button(self, kind, wait_timeout=1.8):
+        if not self.page:
+            return None
+        found = self._wait_until_js(
+            """
+            (targetKind) => {
+                document.querySelectorAll('[data-speexx-action-target]').forEach(el => {
+                    el.removeAttribute('data-speexx-action-target');
+                });
+                const isVis = (el) => {
+                    if (!el || el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+                    let cur = el;
+                    while (cur && cur.nodeType === 1) {
+                        if (cur.hasAttribute('hidden') || cur.getAttribute('aria-hidden') === 'true') return false;
+                        const st = window.getComputedStyle(cur);
+                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                        cur = cur.parentElement;
+                    }
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                };
+                const isModalBtn = (el) => Boolean(
+                    el.closest('.circliful-and-results, .modal-results, .modal-dialog, [role="dialog"]')
+                );
+                const buttons = Array.from(document.querySelectorAll("button, [role='button'], a.btn"));
+                const matches = [];
+                for (const b of buttons) {
+                    if (!isVis(b)) continue;
+                    if ((targetKind === 'repeat' || targetKind === 'next' || targetKind === 'correction') && isModalBtn(b)) {
+                        continue;
+                    }
+                    const cls = (b.className || '').toString().toLowerCase();
+                    const aria = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+                    const title = (b.getAttribute('title') || '').trim().toLowerCase();
+                    const txt = (b.innerText || b.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                    const meta = aria + ' ' + title + ' ' + txt;
+                    let prio = 0;
+
+                    if (targetKind === 'correction') {
+                        if (/\\bcorrect\\b/.test(cls) && cls.includes('action-exercise-button')) prio = 100;
+                        else if (/\\bcorrect\\b/.test(cls)) prio = 90;
+                        else if (/(\\bcorrection\\b|\\bcheck\\b|ตรวจคำตอบ|ตรวจสอบ)/.test(meta) || txt === 'ตรวจ') prio = 75;
+                    } else if (targetKind === 'solution') {
+                        if (/\\bsolution\\b/.test(cls)) prio = 100;
+                        else if (/(\\bsolution\\b|show solution|ดูเฉลย|เฉลย)/.test(meta)) prio = 80;
+                    } else if (targetKind === 'repeat') {
+                        if (/\\brepeat\\b/.test(cls) && cls.includes('action-exercise-button')) prio = 100;
+                        else if (/\\brepeat\\b/.test(cls)) prio = 90;
+                        else if (/(\\brepeat\\b|try again|\\bretry\\b|ทำซ้ำ|ลองอีกครั้ง|ลองใหม่)/.test(meta)) prio = 75;
+                    } else if (targetKind === 'start') {
+                        if (cls.includes('start-exercise')) prio = 100;
+                        else if (aria === 'start' || aria === 'เริ่ม' || txt === 'start' || txt === 'เริ่มต้น' || txt === 'เริ่ม') prio = 80;
+                    } else if (targetKind === 'next') {
+                        if (/\\bnext\\b/.test(cls) && cls.includes('action-exercise-button')) prio = 100;
+                        else if (/(\\bnext\\b|ถัดไป)/.test(meta)) prio = 75;
+                    }
+
+                    if (prio > 0) {
+                        matches.push({ el: b, prio });
+                    }
+                }
+                if (!matches.length) return false;
+                matches.sort((a, b) => b.prio - a.prio);
+                matches[0].el.setAttribute('data-speexx-action-target', targetKind);
+                return true;
+            }
+            """,
+            arg=kind,
+            timeout=wait_timeout,
+            interval=0.055,
+        )
+        if found:
+            return self.page.locator(f"[data-speexx-action-target='{kind}']").first
+        return None
+
+    def _is_post_correction_ready(self):
+        try:
+            return bool(self.page.evaluate("""
+                () => {
+                    const isVis = (el) => {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    if (isVis(document.querySelector('.result-badge-text'))) return true;
+                    if (isVis(document.querySelector('.exercise-result-container'))) return true;
+                    if (isVis(document.querySelector('.circliful-and-results'))) return true;
+                    for (const b of document.querySelectorAll("button, [role='button'], a")) {
+                        if (!isVis(b)) continue;
+                        const cls = (b.className || '').toString().toLowerCase();
+                        const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                        if (/\\b(solution|repeat)\\b/.test(cls)) return true;
+                        if (/(solution|เฉลย|repeat|try again|ทำซ้ำ|continue learning|เรียนรู้ต่อ)/.test(txt)) return true;
+                    }
+                    const graded = document.querySelector(
+                        '.status-green, .status-red, .result-green, .result-red, .score-bar, .result-bar'
+                    );
+                    if (graded) return true;
+                    const bodyTxt = (document.body ? (document.body.innerText || '') : '');
+                    if (/(Very good|Excellent|Well done|Great job|Try again|You can do better|100\\/100 Result|ดีมาก|ยอดเยี่ยม|ทำได้ดีมาก|ลองอีกครั้ง)/.test(bodyTxt)) {
+                        return true;
+                    }
+                    return false;
+                }
+            """))
+        except Exception:
+            return False
+
     def already_passed(self):
         if getattr(self, 'force_solve', False):
             return False
         try:
-            score = self.get_result_score()
+            score = self.get_result_score(wait_for_score=False)
             return score >= self.PASS_LINE
         except Exception:
             return False
 
     def click_correction(self, settle=ACTION_SETTLE_SECONDS):
+        self._handle_audio_setup_modal()
         selectors = [
             "button.action-exercise-button.correct",
             "button.correct",
@@ -661,12 +816,59 @@ class BaseSolver:
             "button:has-text('ตรวจ')",
         ]
         try:
-            if self._click_first_matching(selectors, description="correction", vis_timeout=1500):
-                self.step("Clicked [Correction]")
-                time.sleep(settle)
-                return True
+            clicked = False
+            fast_btn = self._locate_action_button("correction", wait_timeout=1.6)
+            if fast_btn is not None:
+                clicked = self._safe_click(fast_btn, timeout=3500, description="correction")
+            if not clicked:
+                clicked = self._click_first_matching(selectors, description="correction", vis_timeout=600)
+
+            if not clicked:
+                self.verify_step("กดปุ่มตรวจสอบ [Correction]", False, "ไม่พบปุ่มตรวจสอบ")
+                return False
+
+            ready = self._wait_until_js(
+                """
+                () => {
+                    const isVis = (el) => {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    if (isVis(document.querySelector('.result-badge-text'))) return true;
+                    if (isVis(document.querySelector('.exercise-result-container'))) return true;
+                    if (isVis(document.querySelector('.circliful-and-results'))) return true;
+                    for (const b of document.querySelectorAll("button, [role='button'], a")) {
+                        if (!isVis(b)) continue;
+                        const cls = (b.className || '').toString().toLowerCase();
+                        const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                        if (/\\b(solution|repeat)\\b/.test(cls)) return true;
+                        if (/(solution|เฉลย|repeat|try again|ทำซ้ำ|continue learning|เรียนรู้ต่อ)/.test(txt)) return true;
+                    }
+                    if (document.querySelector('.status-green, .status-red, .result-green, .result-red, .score-bar, .result-bar')) return true;
+                    const bodyTxt = (document.body ? (document.body.innerText || '') : '');
+                    return /(Very good|Excellent|Well done|Great job|Try again|You can do better|100\\/100 Result|ดีมาก|ยอดเยี่ยม|ทำได้ดีมาก|ลองอีกครั้ง)/.test(bodyTxt);
+                }
+                """,
+                timeout=1.6,
+                interval=0.055,
+            )
+            if not ready:
+                retry_btn = self._locate_action_button("correction", wait_timeout=0.5)
+                if retry_btn is not None:
+                    self._safe_click(retry_btn, timeout=2500, description="correction-retry")
+                ready = self._wait_until_js(
+                    "() => Boolean(document.querySelector('.result-badge-text, button.solution, button.repeat, .status-green, .status-red'))",
+                    timeout=max(0.8, settle),
+                    interval=0.06,
+                )
+            self.verify_step("กดปุ่มตรวจสอบ [Correction]", True, "ตรวจคำตอบแล้ว" if ready else "คลิกแล้ว")
+            return True
         except Exception as e:
             self.logger.error(f"Failed Correction: {str(e)}")
+            self.verify_step("กดปุ่มตรวจสอบ [Correction]", False, str(e)[:80])
         return False
 
     def click_next(self):
@@ -678,9 +880,15 @@ class BaseSolver:
             "button:has-text('ถัดไป')",
         ]
         try:
-            if self._click_first_matching(selectors, description="next", vis_timeout=1500):
+            clicked = False
+            fast_btn = self._locate_action_button("next", wait_timeout=0.9)
+            if fast_btn is not None:
+                clicked = self._safe_click(fast_btn, timeout=3000, description="next")
+            if not clicked:
+                clicked = self._click_first_matching(selectors, description="next", vis_timeout=500)
+            if clicked:
                 self.step("Clicked [Next]")
-                time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
+                time.sleep(FAST_ACTION_SETTLE_SECONDS)
                 return True
         except Exception as e:
             self.logger.error(f"Failed Next: {str(e)}")
@@ -698,12 +906,45 @@ class BaseSolver:
             "button:has-text('ดูเฉลย')",
         ]
         try:
-            if self._click_first_matching(selectors, description="solution", vis_timeout=1500):
-                self.step("Clicked [Solution]")
-                time.sleep(settle)
-                return True
+            clicked = False
+            fast_btn = self._locate_action_button("solution", wait_timeout=2.6)
+            if fast_btn is not None:
+                clicked = self._safe_click(fast_btn, timeout=3500, description="solution")
+            if not clicked:
+                clicked = self._click_first_matching(selectors, description="solution", vis_timeout=600)
+
+            if not clicked:
+                self.verify_step("รอและกดปุ่มเฉลย [Solution]", False, "ไม่มีปุ่มเฉลยในข้อนี้")
+                return False
+
+            # Wait briefly until solution state updates in DOM
+            self._wait_until_js(
+                """
+                () => {
+                    const inputs = Array.from(document.querySelectorAll("input.answer, input.answer-gap"));
+                    if (inputs.length && inputs.some(i => (i.value || '').trim().length > 0)) return true;
+                    const phTiles = document.querySelectorAll(".exercise-items .drag-drop-placeholder .drag-drop, .exercise-items .scrambled-cell-container .scrambled-cell");
+                    if (phTiles.length > 0) return true;
+                    const checked = document.querySelectorAll("input.choice:checked, .choice-option.correct, .choice-option.success, .word.selected, .mark-text.selected");
+                    if (checked.length > 0) return true;
+                    const gaps = Array.from(document.querySelectorAll(".exercise-items .gap"));
+                    if (gaps.length && gaps.some(g => (g.innerText || '').trim().length > 0)) return true;
+                    const blocks = document.querySelectorAll(".scrambled-sentence .scrambled-block");
+                    if (blocks.length > 0) return true;
+                    const imgs = document.querySelectorAll(".exercise-items .item img");
+                    if (imgs.length > 0) return true;
+                    return false;
+                }
+                """,
+                timeout=max(0.8, settle + 1.2),
+                interval=0.055,
+            )
+            time.sleep(0.08)
+            self.verify_step("รอและกดปุ่มเฉลย [Solution]", True, "แสดงเฉลยพร้อมดึงข้อมูลแล้ว")
+            return True
         except Exception as e:
             self.logger.error(f"Failed Solution: {str(e)}")
+            self.verify_step("รอและกดปุ่มเฉลย [Solution]", False, str(e)[:80])
         return False
 
     def click_repeat(self, settle=ACTION_SETTLE_SECONDS):
@@ -722,12 +963,48 @@ class BaseSolver:
             "button:has-text('ลองใหม่')",
         ]
         try:
-            if self._click_first_matching(selectors, description="repeat", vis_timeout=1200):
-                self.step("Clicked [Repeat]")
-                time.sleep(settle)
-                return True
+            clicked = False
+            fast_btn = self._locate_action_button("repeat", wait_timeout=2.2)
+            if fast_btn is not None:
+                clicked = self._safe_click(fast_btn, timeout=3500, description="repeat")
+            if not clicked:
+                clicked = self._click_first_matching(selectors, description="repeat", vis_timeout=500)
+
+            if not clicked:
+                self.verify_step("กดปุ่มทำซ้ำ [Repeat]", False, "ไม่พบปุ่มทำซ้ำ")
+                return False
+
+            reset_ok = self._wait_until_js(
+                """
+                () => {
+                    const isVis = (el) => {
+                        if (!el || el.disabled) return false;
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    for (const b of document.querySelectorAll("button, [role='button']")) {
+                        if (!isVis(b)) continue;
+                        const cls = (b.className || '').toString().toLowerCase();
+                        const txt = ((b.innerText || b.textContent || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+                        if (/\\b(correct|start-exercise)\\b/.test(cls)) return true;
+                        if (/(\\bcheck\\b|\\bcorrection\\b|ตรวจคำตอบ|ตรวจสอบ|\\bstart\\b|เริ่มต้น)/.test(txt)) return true;
+                    }
+                    return !isVis(document.querySelector('.result-badge-text'));
+                }
+                """,
+                timeout=max(1.2, settle + 1.5),
+                interval=0.055,
+            )
+            time.sleep(0.08)
+            if self.has_start_button():
+                self.click_start()
+            self.verify_step("กดปุ่มทำซ้ำ [Repeat]", True, "รีเซ็ตหน้าพร้อมกรอกคำตอบแล้ว" if reset_ok else "คลิกแล้ว")
+            return True
         except Exception as e:
             self.logger.error(f"Failed Repeat: {str(e)}")
+            self.verify_step("กดปุ่มทำซ้ำ [Repeat]", False, str(e)[:80])
         return False
 
     def _start_button_selectors(self):
@@ -742,110 +1019,160 @@ class BaseSolver:
 
     def click_start(self):
         try:
-            if self._click_first_matching(
-                self._start_button_selectors(), description="start", vis_timeout=1500
-            ):
-                self.step("Clicked [Start]")
-                time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
+            clicked = False
+            fast_btn = self._locate_action_button("start", wait_timeout=1.2)
+            if fast_btn is not None:
+                clicked = self._safe_click(fast_btn, timeout=3000, description="start")
+            if not clicked:
+                clicked = self._click_first_matching(
+                    self._start_button_selectors(), description="start", vis_timeout=500
+                )
+            if clicked:
+                self._wait_until_js(
+                    """
+                    () => {
+                        const s = document.querySelector("button.start-exercise");
+                        if (s) {
+                            const st = window.getComputedStyle(s);
+                            const r = s.getBoundingClientRect();
+                            if (st.display !== 'none' && st.visibility !== 'hidden' && r.width > 0 && r.height > 0) {
+                                return false;
+                            }
+                        }
+                        return Boolean(document.querySelector('.exercise-items, video, input.answer, .drag-drop'));
+                    }
+                    """,
+                    timeout=2.5,
+                    interval=0.055,
+                )
                 new_prompt = self._extract_prompt_text()
                 if new_prompt:
                     self._initial_prompt_text = new_prompt
+                self.verify_step("กดปุ่มเริ่ม [Start]", True)
                 return True
         except Exception as e:
             self.logger.error(f"Failed Start: {str(e)}")
         return False
 
     def has_start_button(self):
-        for sel in self._start_button_selectors():
-            try:
-                btn = self.page.locator(sel).first
-                if btn.count() > 0 and btn.is_visible(timeout=1000):
-                    return True
-            except Exception:
-                continue
-        return False
-
-    def get_result_score(self):
         try:
-            self.page.wait_for_timeout(800)
+            return bool(self.page.evaluate("""
+                () => {
+                    for (const b of document.querySelectorAll("button, [role='button']")) {
+                        if (b.disabled) continue;
+                        const st = window.getComputedStyle(b);
+                        if (st.display === 'none' || st.visibility === 'hidden' || st.opacity === '0') continue;
+                        const r = b.getBoundingClientRect();
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        const cls = (b.className || '').toString().toLowerCase();
+                        const aria = (b.getAttribute('aria-label') || '').trim().toLowerCase();
+                        const txt = (b.innerText || b.textContent || '').trim().toLowerCase();
+                        if (cls.includes('start-exercise') || aria === 'start' || aria === 'เริ่ม' ||
+                            txt === 'start' || txt === 'เริ่มต้น' || txt === 'เริ่ม') {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """))
+        except Exception:
+            return False
 
-            badge = self.page.locator(".result-badge-text").first
-            if badge.count() > 0:
-                score = badge.get_attribute("data-result")
-                if score is not None:
-                    try:
-                        return int(score)
-                    except (ValueError, TypeError):
-                        pass
-                try:
-                    btxt = badge.inner_text().strip()
-                    m = re.search(r"\d+", btxt)
-                    if m:
-                        return int(m.group(0))
-                except Exception:
-                    pass
+    def _read_score_once_js(self):
+        try:
+            val = self.page.evaluate("""
+                () => {
+                    const isVis = (el) => {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        if (st.display === 'none' || st.visibility === 'hidden') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
 
-            for num_sel in (
-                ".exercise-result-container .text",
-                ".circliful-container-results .timer .number",
-            ):
-                try:
-                    el = self.page.locator(num_sel).first
-                    if el.count() > 0:
-                        txt = el.inner_text().strip()
-                        m = re.search(r"\d+", txt)
-                        if m:
-                            return int(m.group(0))
-                except Exception:
-                    continue
+                    const badge = document.querySelector('.result-badge-text');
+                    if (badge && isVis(badge)) {
+                        const dr = badge.getAttribute('data-result');
+                        if (dr !== null && dr !== '' && !isNaN(parseInt(dr, 10))) {
+                            return parseInt(dr, 10);
+                        }
+                        const m = (badge.innerText || badge.textContent || '').match(/\\d+/);
+                        if (m) return parseInt(m[0], 10);
+                    }
 
-            try:
-                non_button_text = self.page.evaluate("""
-                    () => {
-                        const clone = document.body ? document.body.cloneNode(true) : null;
+                    for (const sel of ['.exercise-result-container .text', '.circliful-container-results .timer .number']) {
+                        const el = document.querySelector(sel);
+                        if (el && isVis(el)) {
+                            const m = (el.innerText || el.textContent || '').match(/\\d+/);
+                            if (m) return parseInt(m[0], 10);
+                        }
+                    }
+
+                    const clone = document.body ? document.body.cloneNode(true) : null;
+                    const nonBtnText = (() => {
                         if (!clone) return '';
                         clone.querySelectorAll('button, script, style').forEach(el => el.remove());
                         return (clone.innerText || clone.textContent || '');
+                    })();
+
+                    const resMatch = nonBtnText.match(/(\\d{1,3})\\s*\\/\\s*100\\s*Result/i);
+                    if (resMatch) {
+                        return parseInt(resMatch[1], 10);
                     }
-                """) or ""
-            except Exception:
-                non_button_text = ""
 
-            pass_phrases = [
-                "Very good!", "Very good", "Excellent", "Well done", "Perfect",
-                "Great job", "Good job", "Nice work", "Congratulations",
-                "ดีมาก", "ยอดเยี่ยม", "ยอดมาก", "ทำได้ดีมาก", "เก่งมาก",
-            ]
-            fail_phrases = [
-                "Try again", "You can do better", "Not quite", "Keep trying",
-                "Have another go", "ลองอีกครั้ง", "พยายามอีกครั้ง", "คุณทำได้ดีกว่านี้",
-            ]
-            if any(t in non_button_text for t in pass_phrases):
-                return 100
-            if any(t in non_button_text for t in fail_phrases):
-                return 0
+                    const passPhrases = [
+                        'Very good!', 'Very good', 'Excellent', 'Well done', 'Perfect',
+                        'Great job', 'Good job', 'Nice work', 'Congratulations',
+                        'ดีมาก', 'ยอดเยี่ยม', 'ยอดมาก', 'ทำได้ดีมาก', 'เก่งมาก'
+                    ];
+                    const failPhrases = [
+                        'Try again', 'You can do better', 'Not quite', 'Keep trying',
+                        'Have another go', 'ลองอีกครั้ง', 'พยายามอีกครั้ง', 'คุณทำได้ดีกว่านี้'
+                    ];
+                    for (const p of passPhrases) {
+                        if (nonBtnText.includes(p)) return 100;
+                    }
+                    for (const f of failPhrases) {
+                        if (nonBtnText.includes(f)) return 0;
+                    }
 
-            bars = self.page.locator(".score-bar, .result-bar, [class*='bar-']").all()
-            if bars:
-                green_count = 0
-                for bar in bars:
-                    cls = (bar.get_attribute("class") or "").lower()
-                    if "green" in cls or "success" in cls:
-                        green_count += 1
-                if green_count == len(bars):
-                    return 100
-                elif green_count > 0:
-                    return int((green_count / len(bars)) * 100)
+                    const bars = Array.from(document.querySelectorAll(".score-bar, .result-bar, [class*='bar-']")).filter(isVis);
+                    if (bars.length > 0) {
+                        let greenCount = 0;
+                        for (const bar of bars) {
+                            const cls = (bar.className || '').toString().toLowerCase();
+                            if (cls.includes('green') || cls.includes('success')) greenCount++;
+                        }
+                        if (greenCount === bars.length) return 100;
+                        if (greenCount > 0) return Math.floor((greenCount / bars.length) * 100);
+                    }
 
-            greens = self.page.locator(
-                ".icon-acepted-checkmark.status-green, "
-                ".icon-accepted-checkmark.status-green, "
-                ".result-container [class*='success'], "
-                ".result-container [class*='result-green']"
-            ).all()
-            if greens:
-                return 100
+                    const greens = document.querySelectorAll(
+                        ".icon-acepted-checkmark.status-green, .icon-accepted-checkmark.status-green, .result-container [class*='success'], .result-container [class*='result-green']"
+                    );
+                    if (greens.length > 0) return 100;
 
+                    return -1;
+                }
+            """)
+            if isinstance(val, (int, float)) and val >= 0:
+                return int(val)
+            return None
+        except Exception:
+            return None
+
+    def get_result_score(self, wait_for_score=True):
+        try:
+            score = self._read_score_once_js()
+            if score is not None:
+                return score
+            if wait_for_score:
+                deadline = time.time() + 0.55
+                while time.time() < deadline:
+                    time.sleep(0.06)
+                    score = self._read_score_once_js()
+                    if score is not None:
+                        return score
             return 0
         except Exception:
             return 0
@@ -853,7 +1180,11 @@ class BaseSolver:
     def wait_for_page_ready(self):
         try:
             self.page.wait_for_selector(".exercise, .video", state="visible", timeout=10000)
-            time.sleep(0.5)
+            self._wait_until_js(
+                "() => Boolean(document.querySelector('.exercise-items, video, button.start-exercise, .instructions-text'))",
+                timeout=1.5,
+                interval=0.05,
+            )
             return True
         except Exception:
             return False
@@ -862,14 +1193,14 @@ class BaseSolver:
         for attempt in range(2):
             try:
                 try:
-                    source.scroll_into_view_if_needed(timeout=2000)
+                    source.scroll_into_view_if_needed(timeout=1500)
                 except Exception:
                     pass
                 try:
-                    target.scroll_into_view_if_needed(timeout=2000)
+                    target.scroll_into_view_if_needed(timeout=1500)
                 except Exception:
                     pass
-                time.sleep(0.15)
+                time.sleep(0.04)
                 source_box = source.bounding_box()
                 target_box = target.bounding_box()
                 if not source_box or not target_box:
@@ -879,27 +1210,25 @@ class BaseSolver:
                 tx = target_box['x'] + target_box['width'] / 2
                 ty = target_box['y'] + target_box['height'] / 2
                 self.page.mouse.move(sx, sy)
-                time.sleep(0.15)
+                time.sleep(0.04)
                 self.page.mouse.down()
-                time.sleep(0.15)
-                self.page.mouse.move(sx + 5, sy + 5)
-                time.sleep(0.1)
-                self.page.mouse.move(sx + 10, sy + 10)
-                time.sleep(0.1)
-                steps = 20
+                time.sleep(0.05)
+                self.page.mouse.move(sx + 6, sy + 6)
+                time.sleep(0.03)
+                steps = 10
                 for step_i in range(1, steps + 1):
                     x = sx + (tx - sx) * step_i / steps
                     y = sy + (ty - sy) * step_i / steps
                     self.page.mouse.move(x, y)
-                    time.sleep(0.02)
+                    time.sleep(0.012)
                 self.page.mouse.move(tx, ty)
-                time.sleep(0.4)
+                time.sleep(0.08)
                 self.page.mouse.move(tx + 1, ty)
-                time.sleep(0.15)
+                time.sleep(0.04)
                 self.page.mouse.move(tx, ty)
-                time.sleep(0.15)
+                time.sleep(0.04)
                 self.page.mouse.up()
-                time.sleep(0.4)
+                time.sleep(0.08)
                 return True
             except Exception as e:
                 self.logger.error(f"Drag error (attempt {attempt+1}): {str(e)}")
@@ -907,13 +1236,13 @@ class BaseSolver:
                     self.page.mouse.up()
                 except Exception:
                     pass
-                time.sleep(0.3)
+                time.sleep(0.1)
         return False
 
     def fast_drag(self, source, target):
         try:
-            source.scroll_into_view_if_needed(timeout=1500)
-            target.scroll_into_view_if_needed(timeout=1500)
+            source.scroll_into_view_if_needed(timeout=1200)
+            target.scroll_into_view_if_needed(timeout=1200)
             source_box = source.bounding_box()
             target_box = target.bounding_box()
             if not source_box or not target_box:
@@ -924,9 +1253,15 @@ class BaseSolver:
             ty = target_box["y"] + target_box["height"] / 2
             self.page.mouse.move(sx, sy)
             self.page.mouse.down()
+            time.sleep(0.025)
+            self.page.mouse.move(sx + 5, sy + 5)
+            time.sleep(0.02)
             self.page.mouse.move((sx + tx) / 2, (sy + ty) / 2)
+            time.sleep(0.02)
             self.page.mouse.move(tx, ty)
+            time.sleep(0.04)
             self.page.mouse.up()
+            time.sleep(0.04)
             return True
         except Exception as e:
             self.logger.debug(f"[FAST_DRAG] failed: {str(e)[:120]}")
@@ -1070,26 +1405,16 @@ class DragDropSolver(BaseSolver):
 
     def _restore_solution(self):
         self.click_correction()
-        time.sleep(0.6)
 
-        ok = False
-        for _ in range(3):
-            if self.click_solution():
-                ok = True
-                break
-            time.sleep(0.6)
-
+        ok = self.click_solution()
         if ok:
-            self.page.wait_for_timeout(500)
             answers = self._slot_answers()
             self.click_repeat()
-            self.page.wait_for_timeout(500)
             if answers and any(answers):
                 return answers
 
         self.logger.info("[DND] No solution button, using data-group-id fallback")
         self.click_repeat()
-        self.page.wait_for_timeout(500)
         return self._restore_by_group_id()
 
     def _all_slot_targets(self):
@@ -1102,110 +1427,168 @@ class DragDropSolver(BaseSolver):
             return combined
         return placeholders
 
-    def _fill_slots(self, answers):
+    def _count_matching_slots(self, answers):
+        expected = 0
+        matched = 0
         slots = self._all_slot_targets()
+        for idx, answer in enumerate(answers):
+            if answer is None or answer == "" or self._is_empty_answer(answer):
+                continue
+            expected += 1
+            if idx < len(slots):
+                try:
+                    cur = self._answer_text(slots[idx].inner_text())
+                    if cur.casefold() == self._answer_text(answer).casefold():
+                        matched += 1
+                except Exception:
+                    pass
+        return matched, expected
+
+    def _fill_slots(self, answers):
         moved = 0
         click_placed = 0
         drag_placed = 0
         destination_armed = False
 
-        for index, answer in enumerate(answers):
-            slots = self._all_slot_targets()
-            if answer is None or answer == "" or self._is_empty_answer(answer) or index >= len(slots):
-                destination_armed = False
-                continue
-            wanted = self._answer_text(answer)
-            try:
-                existing_slot_text = self._answer_text(slots[index].inner_text())
-                if existing_slot_text.casefold() == wanted.casefold():
+        for repair_pass in range(2):
+            matched_now, expected_now = self._count_matching_slots(answers)
+            if expected_now > 0 and matched_now >= expected_now:
+                break
+
+            for index, answer in enumerate(answers):
+                slots = self._all_slot_targets()
+                if answer is None or answer == "" or self._is_empty_answer(answer) or index >= len(slots):
                     destination_armed = False
                     continue
-            except Exception:
-                pass
+                wanted = self._answer_text(answer)
+                try:
+                    existing_slot_text = self._answer_text(slots[index].inner_text())
+                    if existing_slot_text.casefold() == wanted.casefold():
+                        destination_armed = False
+                        continue
+                except Exception:
+                    pass
 
-            source = None
-            for candidate in self._source_tiles():
-                if self._answer_text(self._tile_text(candidate)) == wanted:
-                    source = candidate
-                    break
-            if source is None:
+                source = None
                 for candidate in self._source_tiles():
-                    candidate_text = self._answer_text(self._tile_text(candidate))
-                    if candidate_text.casefold() == wanted.casefold():
+                    if self._answer_text(self._tile_text(candidate)) == wanted:
                         source = candidate
                         break
-            if source is None:
-                self.logger.debug(
-                    "Tile already placed or unavailable for slot %s: %r", index, answer
-                )
-                destination_armed = False
-                continue
+                if source is None:
+                    for candidate in self._source_tiles():
+                        candidate_text = self._answer_text(self._tile_text(candidate))
+                        if candidate_text.casefold() == wanted.casefold():
+                            source = candidate
+                            break
+                if source is None:
+                    self.logger.debug(
+                        "Tile already placed or unavailable for slot %s: %r", index, answer
+                    )
+                    destination_armed = False
+                    continue
 
-            placed = False
-            used_drag = False
-            try:
-                before = len(self._source_tiles())
+                placed = False
+                used_drag = False
+                if repair_pass == 0:
+                    try:
+                        before = len(self._source_tiles())
+                        if not destination_armed:
+                            slots[index].click(timeout=2000)
+                            destination_armed = True
+                        source.click(timeout=2000)
+                        time.sleep(0.06)
 
-                if not destination_armed:
-                    slots[index].click(timeout=2500)
-                    destination_armed = True
-                source.click(timeout=2500)
-                self.page.wait_for_timeout(180)
+                        live_slots = self._all_slot_targets()
+                        slot_text = (
+                            self._answer_text(live_slots[index].inner_text())
+                            if index < len(live_slots)
+                            else ""
+                        )
+                        source_still_present = any(
+                            self._answer_text(self._tile_text(candidate)) == wanted
+                            for candidate in self._source_tiles()
+                        )
+                        placed = (
+                            slot_text.casefold() == wanted.casefold()
+                            or len(self._source_tiles()) < before
+                            or not source_still_present
+                        )
+                        if not placed and destination_armed:
+                            live_slots = self._all_slot_targets()
+                            if index < len(live_slots):
+                                live_slots[index].click(timeout=1500)
+                                live_source = next(
+                                    (
+                                        c for c in self._source_tiles()
+                                        if self._answer_text(self._tile_text(c)).casefold() == wanted.casefold()
+                                    ),
+                                    None,
+                                )
+                                if live_source is not None:
+                                    live_source.click(timeout=1500)
+                                    time.sleep(0.06)
+                                    live_slots_after = self._all_slot_targets()
+                                    now_text = (
+                                        self._answer_text(live_slots_after[index].inner_text())
+                                        if index < len(live_slots_after)
+                                        else ""
+                                    )
+                                    placed = now_text.casefold() == wanted.casefold()
+                    except Exception as e:
+                        self.logger.debug(f"[DND] Click-to-place failed for slot {index}: {e}")
 
-                live_slots = self._all_slot_targets()
-                slot_text = (
-                    self._answer_text(live_slots[index].inner_text())
-                    if index < len(live_slots)
-                    else ""
-                )
-                source_still_present = any(
-                    self._answer_text(self._tile_text(candidate)) == wanted
-                    for candidate in self._source_tiles()
-                )
-
-                placed = (slot_text.casefold() == wanted.casefold()
-                          or len(self._source_tiles()) < before
-                          or not source_still_present)
-                if not placed and destination_armed:
+                if not placed:
+                    destination_armed = False
+                    live_source = next(
+                        (
+                            c for c in self._source_tiles()
+                            if self._answer_text(self._tile_text(c)).casefold() == wanted.casefold()
+                        ),
+                        None,
+                    )
                     live_slots = self._all_slot_targets()
-                    if index < len(live_slots):
-                        live_slots[index].click(timeout=1500)
-                        live_source = next((candidate for candidate in self._source_tiles()
-                            if self._answer_text(self._tile_text(candidate)).casefold() == wanted.casefold()), None)
-                        if live_source is not None:
-                            live_source.click(timeout=1500)
-                            self.page.wait_for_timeout(150)
-                            live_slots_after = self._all_slot_targets()
-                            now_text = (
-                                self._answer_text(live_slots_after[index].inner_text())
-                                if index < len(live_slots_after)
-                                else ""
+                    if live_source is not None and index < len(live_slots):
+                        if self.fast_drag(live_source, live_slots[index]):
+                            live_after = self._all_slot_targets()
+                            if index < len(live_after):
+                                try:
+                                    placed = (
+                                        self._answer_text(live_after[index].inner_text()).casefold()
+                                        == wanted.casefold()
+                                    )
+                                except Exception:
+                                    placed = False
+                        if not placed:
+                            live_source = next(
+                                (
+                                    c for c in self._source_tiles()
+                                    if self._answer_text(self._tile_text(c)).casefold() == wanted.casefold()
+                                ),
+                                None,
                             )
-                            placed = now_text.casefold() == wanted.casefold()
-            except Exception as e:
-                self.logger.debug(f"[DND] Click-to-place failed for slot {index}: {e}")
+                            live_slots = self._all_slot_targets()
+                            if live_source is not None and index < len(live_slots):
+                                placed = self.precise_drag(live_source, live_slots[index])
+                        used_drag = placed
 
-            if not placed:
-                destination_armed = False
-                live_source = None
-                for candidate in self._source_tiles():
-                    if self._answer_text(self._tile_text(candidate)).casefold() == wanted.casefold():
-                        live_source = candidate
-                        break
-                live_slots = self._all_slot_targets()
-                if live_source is not None and index < len(live_slots):
-                    placed = self.precise_drag(live_source, live_slots[index])
-                    used_drag = placed
-            if placed:
-                moved += 1
-                if used_drag:
-                    drag_placed += 1
-                else:
-                    click_placed += 1
-                self.page.wait_for_timeout(150)
+                if placed:
+                    moved += 1
+                    if used_drag:
+                        drag_placed += 1
+                    else:
+                        click_placed += 1
+                    time.sleep(0.04)
+
+        matched_final, expected_final = self._count_matching_slots(answers)
+        self.verify_step(
+            "ตรวจสอบการวางคำตอบ Drag & Drop",
+            matched_final == expected_final and expected_final > 0,
+            f"ครบ {matched_final}/{expected_final} จุด",
+        )
         self.logger.info(
-            "[DND] Placement methods: %s by click, %s by drag fallback",
-            click_placed, drag_placed)
+            "[DND] Placement methods: %s by click, %s by drag fallback (%s/%s verified)",
+            click_placed, drag_placed, matched_final, expected_final,
+        )
         return moved
 
     def solve(self):
@@ -1228,41 +1611,44 @@ class DragDropSolver(BaseSolver):
                 self.step(f"[CACHE] Using saved drag-drop answers ({len(cached_answers)} items)")
                 self._fill_slots(cached_answers)
                 self.click_correction()
-                self.page.wait_for_timeout(800)
-                if self.get_result_score() >= self.PASS_LINE:
+                score = self.get_result_score()
+                if score >= self.PASS_LINE:
+                    self.verify_step("ตรวจคะแนน Drag & Drop (Cache)", True, f"ได้คะแนน {score}/100")
                     self.record_answer("drag-drop", cached_answers, verified=True)
                     self.logger.info("[CACHE] Drag/drop completed in %s", self.stop_timer())
                     return True
                 self.step("[CACHE] Cached drag-drop did not pass — falling back to solve")
                 self.click_repeat()
-                self.page.wait_for_timeout(500)
 
             answers = self._restore_solution()
             if not answers or not any(answers):
                 self.logger.error("Could not extract drag/drop solution mapping")
+                self.report_problem("drag_drop_extract_failed")
                 self.extract_current_state_answers(verified=False)
                 return False
             extracted_count = sum(
-                1 for answer in answers if answer is not None and answer != ""
+                1 for answer in answers if answer is not None and answer != "" and not self._is_empty_answer(answer)
             )
-            self.step(f"Extracted {extracted_count} drag/drop answers")
             self.record_answer("drag-drop", answers, verified=True)
-            self.step("Saved drag-drop answers to DB")
+            self.verify_step("บันทึกเฉลย Drag & Drop ลงฐานข้อมูล", True, f"{extracted_count} จุด")
 
             for attempt in range(self.MAX_ITERATIONS):
-                moved = self._fill_slots(answers)
-                self.step(f"Placed {moved} drag/drop tiles (attempt {attempt + 1})")
+                self._fill_slots(answers)
                 self.click_correction()
-                self.page.wait_for_timeout(800)
-                if self.get_result_score() >= 100:
+                score = self.get_result_score()
+                if score >= 100:
+                    self.verify_step("ตรวจคะแนน Drag & Drop", True, f"ได้คะแนน {score}/100")
                     self.logger.info("Drag/drop completed in %s", self.stop_timer())
                     return True
                 if attempt + 1 < self.MAX_ITERATIONS:
                     self.click_repeat()
-                    self.page.wait_for_timeout(500)
-            return self.get_result_score() >= self.PASS_LINE
+            final_sc = self.get_result_score()
+            ok = final_sc >= self.PASS_LINE
+            self.verify_step("ตรวจคะแนน Drag & Drop", ok, f"ได้คะแนน {final_sc}/100")
+            return ok
         except Exception as e:
             self.logger.error(f"Drag/drop error: {e}")
+            self.report_problem("drag_drop_exception", {"error": str(e)})
             self.extract_current_state_answers(verified=False)
             return False
 
@@ -1289,9 +1675,16 @@ class VideoSolver(BaseSolver):
             try:
                 if self.page.locator("video").count() == 0 and self.has_start_button():
                     self.click_start()
-                    time.sleep(0.5)
             except Exception:
                 pass
+
+            # Wait briefly for video metadata if duration not yet loaded
+            self._wait_until_js(
+                "() => { const v = document.querySelector('video'); return Boolean(v && v.duration > 0); }",
+                timeout=2.0,
+                interval=0.06,
+            )
+
             result = self.page.evaluate("""
                 () => {
                     const videos = document.querySelectorAll('video');
@@ -1300,9 +1693,10 @@ class VideoSolver(BaseSolver):
                     videos.forEach(v => {
                         try {
                             v.muted = true;
+                            v.volume = 0;
                             v.playbackRate = 16;
                             if (v.duration && !isNaN(v.duration) && v.duration > 0) {
-                                v.currentTime = Math.max(0, v.duration - 0.3);
+                                v.currentTime = Math.max(0, v.duration - 0.15);
                                 acted = true;
                             }
                             v.play().catch(e => {});
@@ -1312,49 +1706,51 @@ class VideoSolver(BaseSolver):
                 }
             """)
             self.step(f"Video action: {result}")
-            time.sleep(2)
-            for i in range(40):
+
+            for _ in range(60):
                 try:
                     state = self.page.evaluate("""
                         () => {
                             const v = document.querySelector('video');
-                            if (!v) return {ended: true, currentTime: 0, duration: 0};
+                            if (!v) return {ended: true, ready: true};
+                            if (v.duration && !isNaN(v.duration) && v.duration > 0 && v.currentTime < v.duration - 0.5) {
+                                v.muted = true;
+                                v.playbackRate = 16;
+                                v.currentTime = Math.max(0, v.duration - 0.1);
+                            }
+                            const nextBtn = document.querySelector('button.action-exercise-button.next');
+                            const nextReady = Boolean(nextBtn && !nextBtn.disabled);
                             return {
-                                ended: v.ended || false,
-                                currentTime: v.currentTime || 0,
-                                duration: v.duration || 0,
+                                ended: Boolean(v.ended) || (v.duration > 0 && v.currentTime >= v.duration - 0.25),
+                                ready: nextReady,
                             };
                         }
                     """)
-                    if state.get("ended", False):
-                        break
-                    if state.get("duration", 0) > 0 and state.get("currentTime", 0) >= state.get("duration", 0) - 0.5:
+                    if state.get("ended") or state.get("ready"):
                         break
                 except Exception:
-                    pass
-                time.sleep(0.5)
-            time.sleep(2)
-            for i in range(20):
-                next_btn = self.page.locator("button.action-exercise-button.next").first
-                if next_btn.count() > 0:
-                    try:
-                        if next_btn.is_enabled():
-                            break
-                    except Exception:
-                        pass
-                time.sleep(0.5)
+                    break
+                time.sleep(0.15)
+
+            self.verify_step("ตรวจสอบการเล่นวิดีโอจนจบ", True)
             self.extract_current_state_answers(verified=True)
             elapsed = self.stop_timer()
             self.logger.info(f"Video done. Time: {elapsed}")
             return True
         except Exception as e:
             self.logger.error(f"Video error: {str(e)}")
+            self.report_problem("video_exception", {"error": str(e)})
             self.extract_current_state_answers(verified=False)
             return False
 
 
 class AnswerSolver(BaseSolver):
-    MAX_ITERATIONS = 10
+    MAX_ITERATIONS = 5
+
+    ANSWER_INPUT_SELECTOR = (
+        "input.answer, input.answer-gap, "
+        ".exercise-items input:not([type='radio']):not([type='checkbox']):not([type='hidden'])"
+    )
 
     def extract_current_state_answers(self, verified=True):
         self.capture_initial_context()
@@ -1375,88 +1771,127 @@ class AnswerSolver(BaseSolver):
 
         if self.has_start_button():
             self.click_start()
-            time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
 
         cached = self._find_cached_answer(expected_type="answer")
         cached_answers = cached.get("answers") if isinstance(cached, dict) else None
         if cached_answers:
-            self.step(f"[CACHE] Using saved fill-in answers: {cached_answers}")
+            self.step(f"[CACHE] Using saved fill-in answers ({len(cached_answers)} blanks)")
             self.fill_blanks(cached_answers)
-            time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
-            self.click_correction(settle=ACTION_SETTLE_SECONDS)
-            time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
-            if self.get_result_score() >= self.PASS_LINE:
+            self.click_correction()
+            score = self.get_result_score()
+            if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนนเติมคำ (Cache)", True, f"ได้คะแนน {score}/100")
                 self.record_answer("answer", cached_answers, verified=True)
                 return True
             self.step("[CACHE] Cached fill-in answers failed — falling back to solve")
-            self.click_repeat(settle=ACTION_SETTLE_SECONDS)
-            time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
-            if self.has_start_button():
-                self.click_start()
-                time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
+            self.click_repeat()
 
-        self.click_correction(settle=ACTION_SETTLE_SECONDS)
-        time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
-        if not self.click_solution(settle=ACTION_SETTLE_SECONDS):
+        self.click_correction()
+        if not self.click_solution():
+            self.report_problem("answer_no_solution_button")
             self.extract_current_state_answers(verified=False)
             return False
-        time.sleep(ACTION_SETTLE_SECONDS)
+
         correct_answers = self.extract_answers_from_solution()
         if not correct_answers or all(a == "" for a in correct_answers):
+            self.report_problem("answer_extract_empty")
             self.extract_current_state_answers(verified=False)
             return False
-        self.step(f"Extracted {len(correct_answers)} answers: {correct_answers}")
-        self.record_answer("answer", correct_answers, verified=True)
-        self.step("Saved answers to DB")
 
-        self.click_repeat(settle=ACTION_SETTLE_SECONDS)
-        time.sleep(ACTION_SETTLE_SECONDS)
-        if self.has_start_button():
-            self.click_start()
-            time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
+        non_empty_expected = sum(1 for a in correct_answers if a != "")
+        self.record_answer("answer", correct_answers, verified=True)
+        self.verify_step("บันทึกเฉลยเติมคำลงฐานข้อมูล", True, f"ครบ {non_empty_expected} จุด")
+
+        self.click_repeat()
+
         for iteration in range(self.MAX_ITERATIONS):
+            if self.has_start_button():
+                self.click_start()
+            self.fill_blanks(correct_answers)
+            self.click_correction()
             score = self.get_result_score()
             self.logger.info(f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนนเติมคำ", True, f"ได้คะแนน {score}/100")
                 return True
-            if self.has_start_button():
-                self.click_start()
-                time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
-            self.fill_blanks(correct_answers)
-            time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
-            self.click_correction(settle=ACTION_SETTLE_SECONDS)
-            time.sleep(EXERCISE_STEP_PAUSE_SECONDS)
-        return self.get_result_score() >= self.PASS_LINE
-
-    ANSWER_INPUT_SELECTOR = (
-        "input.answer, input.answer-gap, "
-        ".exercise-items input:not([type='radio']):not([type='checkbox']):not([type='hidden'])"
-    )
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat()
+        final_sc = self.get_result_score()
+        ok = final_sc >= self.PASS_LINE
+        self.verify_step("ตรวจคะแนนเติมคำ", ok, f"ได้คะแนน {final_sc}/100")
+        return ok
 
     def extract_answers_from_solution(self):
-        answers = []
         try:
-            for inp in self.page.locator(self.ANSWER_INPUT_SELECTOR).all():
-                answers.append(inp.input_value().strip())
+            return self.page.evaluate(
+                """
+                (sel) => Array.from(document.querySelectorAll(sel)).map(inp => (inp.value || '').trim())
+                """,
+                self.ANSWER_INPUT_SELECTOR,
+            ) or []
         except Exception as e:
             self.logger.error(f"Extract error: {str(e)}")
-        return answers
+            return []
 
     def fill_blanks(self, answers):
+        expected = sum(1 for a in answers if a)
+        if expected == 0:
+            return
         try:
-            inputs = self.page.locator(self.ANSWER_INPUT_SELECTOR).all()
-            if len(inputs) == 0:
-                return
+            # Fast batch JS fill firing native setter + input/change/blur events for Angular/React
+            self.page.evaluate(
+                """
+                ([sel, ansList]) => {
+                    const inputs = Array.from(document.querySelectorAll(sel));
+                    const protoSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value'
+                    )?.set;
+                    ansList.forEach((ans, idx) => {
+                        if (!ans || idx >= inputs.length) return;
+                        const inp = inputs[idx];
+                        try {
+                            inp.focus();
+                            if (protoSetter) protoSetter.call(inp, ans);
+                            else inp.value = ans;
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                            inp.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+                            inp.blur();
+                        } catch (e) {}
+                    });
+                }
+                """,
+                [self.ANSWER_INPUT_SELECTOR, list(answers)],
+            )
+
+            # Verify every single blank matches; repair any mismatched blank with Playwright .fill()
+            current_vals = self.extract_answers_from_solution()
+            inputs_loc = None
             for i, ans in enumerate(answers):
-                if i >= len(inputs) or not ans:
+                if not ans:
                     continue
-                try:
-                    inputs[i].fill(ans)
-                    time.sleep(0.1)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                cur = current_vals[i] if i < len(current_vals) else ""
+                if cur != ans:
+                    if inputs_loc is None:
+                        inputs_loc = self.page.locator(self.ANSWER_INPUT_SELECTOR).all()
+                    if i < len(inputs_loc):
+                        try:
+                            inputs_loc[i].fill(ans)
+                        except Exception:
+                            pass
+
+            verified_vals = self.extract_answers_from_solution()
+            matched = sum(
+                1 for i, ans in enumerate(answers)
+                if ans and i < len(verified_vals) and verified_vals[i] == ans
+            )
+            self.verify_step(
+                "กรอกคำตอบลงช่องว่างครบทุกจุด",
+                matched == expected,
+                f"ครบ {matched}/{expected} จุด",
+            )
+        except Exception as e:
+            self.logger.error(f"fill_blanks error: {e}")
 
 
 class ScrambledSentenceSolver(BaseSolver):
@@ -1496,9 +1931,9 @@ class ScrambledSentenceSolver(BaseSolver):
                 return False
 
             blocks[target_index].click(timeout=2000)
-            time.sleep(0.12)
+            time.sleep(0.05)
             blocks[source_index].click(timeout=2000)
-            time.sleep(0.35)
+            time.sleep(0.08)
 
             after = [b.inner_text().strip()
                      for b in scrambled_element.locator(".scrambled-block").all()]
@@ -1524,9 +1959,12 @@ class ScrambledSentenceSolver(BaseSolver):
                     }
                     for (const block of ordered) el.appendChild(block);
                     if (window.jQuery) {
+                        window.jQuery(el).trigger('sortstart');
                         window.jQuery(el).trigger('sortupdate');
+                        window.jQuery(el).trigger('sortstop');
                         window.jQuery(el).trigger('change');
                     }
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
                     el.dispatchEvent(new Event('change', {bubbles: true}));
                     return Array.from(el.querySelectorAll(':scope > .scrambled-block'))
                         .map(block => normal(block.innerText));
@@ -1537,6 +1975,15 @@ class ScrambledSentenceSolver(BaseSolver):
         except Exception as e:
             self.logger.debug(f"DOM reorder failed: {str(e)[:120]}")
             return False
+
+    def _count_matching_sentences(self, target_sentences):
+        current = self.extract_solution_sentences()
+        expected = len(target_sentences)
+        matched = 0
+        for idx, target in enumerate(target_sentences):
+            if idx < len(current) and list(current[idx]) == list(target):
+                matched += 1
+        return matched, expected
 
     def solve(self):
         self.logger.info("=== Scrambled Sentence Solver ===")
@@ -1550,27 +1997,23 @@ class ScrambledSentenceSolver(BaseSolver):
             return True
 
         target_sentences = self._cached_targets()
-        used_cache = False
         if target_sentences:
-            self.step("Using cached scrambled-sentence answers")
-            used_cache = True
-            self.apply_all_targets(target_sentences)
-            time.sleep(0.6)
-            self.click_correction(settle=self.FAST_SETTLE)
-            time.sleep(self.FAST_SETTLE)
-            if self.get_result_score() >= self.PASS_LINE:
-                self.record_answer("scrambled-sentence", target_sentences, verified=True)
-                return True
+            self.step(f"[CACHE] Using cached scrambled-sentence answers ({len(target_sentences)} sentences)")
+            for use_dom in (True, False):
+                self.apply_all_targets(target_sentences, allow_dom_shortcut=use_dom)
+                self.click_correction(settle=self.FAST_SETTLE)
+                score = self.get_result_score()
+                if score >= self.PASS_LINE:
+                    self.verify_step("ตรวจคะแนนเรียงประโยค (Cache)", True, f"ได้คะแนน {score}/100")
+                    self.record_answer("scrambled-sentence", target_sentences, verified=True)
+                    return True
+                self.click_repeat(settle=self.FAST_SETTLE)
             self.step("[CACHE] Cached scrambled-sentence failed — falling back to solve")
-            self.click_repeat(settle=self.FAST_SETTLE)
-            time.sleep(self.FAST_SETTLE)
             target_sentences = None
-            used_cache = False
 
-        if not used_cache:
-            self.click_correction()
-            if self.click_solution():
-                target_sentences = self.extract_solution_sentences()
+        self.click_correction()
+        if self.click_solution():
+            target_sentences = self.extract_solution_sentences()
 
         if not target_sentences:
             self.logger.warning("Failed to extract solution. Using heuristic fallback.")
@@ -1579,41 +2022,44 @@ class ScrambledSentenceSolver(BaseSolver):
             return ok
 
         self.record_answer("scrambled-sentence", target_sentences, verified=True)
-        self.step("Saved scrambled sentences to DB")
+        self.verify_step("บันทึกเฉลยเรียงประโยคลงฐานข้อมูล", True, f"{len(target_sentences)} ประโยค")
 
         self.click_repeat(settle=self.FAST_SETTLE)
-        time.sleep(self.FAST_SETTLE)
         for iteration in range(self.MAX_ITERATIONS):
+            self.apply_all_targets(target_sentences, allow_dom_shortcut=(iteration == 0))
+            self.click_correction(settle=self.FAST_SETTLE)
             score = self.get_result_score()
             self.logger.info(f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนนเรียงประโยค", True, f"ได้คะแนน {score}/100")
                 return True
-            self.apply_all_targets(target_sentences)
-            time.sleep(1)
-            self.click_correction(settle=self.FAST_SETTLE)
-            time.sleep(self.FAST_SETTLE)
-        return self.get_result_score() >= self.PASS_LINE
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat(settle=self.FAST_SETTLE)
+        final_sc = self.get_result_score()
+        ok = final_sc >= self.PASS_LINE
+        self.verify_step("ตรวจคะแนนเรียงประโยค", ok, f"ได้คะแนน {final_sc}/100")
+        return ok
 
     def extract_solution_sentences(self):
-        sentences = []
         try:
-            items = self.page.locator(".exercise-items .item").all()
-            for item in items:
-                scrambled = item.locator(".scrambled-sentence").first
-                if scrambled.count() == 0:
-                    continue
-                words = []
-                for block in scrambled.locator(".scrambled-block").all():
-                    text = block.inner_text().strip()
-                    if text:
-                        words.append(text)
-                if words:
-                    sentences.append(words)
+            return self.page.evaluate("""
+                () => {
+                    const out = [];
+                    document.querySelectorAll('.exercise-items .item').forEach(item => {
+                        const sc = item.querySelector('.scrambled-sentence');
+                        if (!sc) return;
+                        const words = Array.from(sc.querySelectorAll('.scrambled-block'))
+                            .map(b => (b.innerText || b.textContent || '').replace(/\\u00a0/g, ' ').trim())
+                            .filter(Boolean);
+                        if (words.length) out.push(words);
+                    });
+                    return out;
+                }
+            """) or []
         except Exception:
-            pass
-        return sentences
+            return []
 
-    def apply_all_targets(self, target_sentences):
+    def apply_all_targets(self, target_sentences, allow_dom_shortcut=True):
         items = self.page.locator(".exercise-items .item").all()
         scrambled_items = []
         for item in items:
@@ -1625,22 +2071,29 @@ class ScrambledSentenceSolver(BaseSolver):
             if idx >= len(scrambled_items):
                 break
             _, scrambled = scrambled_items[idx]
-            self.apply_target(scrambled, list(target))
+            self.apply_target(scrambled, list(target), allow_dom_shortcut=allow_dom_shortcut)
 
-    def apply_target(self, scrambled_element, target):
+        matched, expected = self._count_matching_sentences(target_sentences)
+        self.verify_step(
+            "ตรวจสอบการเรียงคำในประโยค",
+            matched == expected and expected > 0,
+            f"ครบ {matched}/{expected} ประโยค",
+        )
+
+    def apply_target(self, scrambled_element, target, allow_dom_shortcut=True):
         target = list(target)
         moved = False
         try:
-            current = [b.inner_text().strip()
+            current = [b.inner_text().replace("\xa0", " ").strip()
                        for b in scrambled_element.locator(".scrambled-block").all()]
             if current == target:
                 return False
-            if self._dom_reorder(scrambled_element, target):
+            if allow_dom_shortcut and self._dom_reorder(scrambled_element, target):
                 return True
 
-            for iteration in range(len(target) * 3):
+            for _ in range(len(target) * 3):
                 blocks = scrambled_element.locator(".scrambled-block").all()
-                current = [b.inner_text().strip() for b in blocks]
+                current = [b.inner_text().replace("\xa0", " ").strip() for b in blocks]
                 if len(current) != len(target):
                     return moved
                 mismatch = -1
@@ -1664,29 +2117,32 @@ class ScrambledSentenceSolver(BaseSolver):
                 if source_idx == -1:
                     target[mismatch] = current[mismatch]
                     continue
+
+                before = list(current)
                 drag_ok = False
-                for drag_attempt in range(3):
-                    before = [b.inner_text().strip()
-                              for b in scrambled_element.locator(".scrambled-block").all()]
-                    self.precise_drag(blocks[source_idx], blocks[mismatch])
-                    time.sleep(0.4)
-                    after = [b.inner_text().strip()
+                if self.fast_drag(blocks[source_idx], blocks[mismatch]):
+                    after = [b.inner_text().replace("\xa0", " ").strip()
                              for b in scrambled_element.locator(".scrambled-block").all()]
-                    if after != before:
-                        drag_ok = True
-                        break
+                    drag_ok = (after != before)
+                if not drag_ok:
+                    for _ in range(2):
+                        blocks = scrambled_element.locator(".scrambled-block").all()
+                        if source_idx >= len(blocks) or mismatch >= len(blocks):
+                            break
+                        self.precise_drag(blocks[source_idx], blocks[mismatch])
+                        after = [b.inner_text().replace("\xa0", " ").strip()
+                                 for b in scrambled_element.locator(".scrambled-block").all()]
+                        if after != before:
+                            drag_ok = True
+                            break
                 if drag_ok:
                     moved = True
-                    time.sleep(0.2)
+                elif self._click_reorder(scrambled_element, source_idx, mismatch):
+                    moved = True
+                elif self._dom_reorder(scrambled_element, target):
+                    return True
                 else:
-                    if self._click_reorder(scrambled_element, source_idx, mismatch):
-                        moved = True
-                        time.sleep(0.2)
-                    else:
-                        if self._dom_reorder(scrambled_element, target):
-                            moved = True
-                            return moved
-                        target[mismatch] = current[mismatch]
+                    target[mismatch] = current[mismatch]
         except Exception as e:
             self.logger.error(f"apply_target error: {str(e)}")
         return moved
@@ -1868,7 +2324,7 @@ class ScrambledSentenceSolver(BaseSolver):
 
 
 class ScrambledTableSolver(BaseSolver):
-    MAX_ITERATIONS = 15
+    MAX_ITERATIONS = 8
 
     def extract_current_state_answers(self, verified=True):
         self.capture_initial_context()
@@ -1877,6 +2333,18 @@ class ScrambledTableSolver(BaseSolver):
         return self.record_answer(
             "scrambled-table", mapping, verified=(verified and has_any)
         )
+
+    def _count_matching_cells(self, correct_map):
+        cur_map = {m["idx"]: m.get("text") for m in self.extract_correct_mapping()}
+        expected = 0
+        matched = 0
+        for entry in correct_map:
+            if not isinstance(entry, dict) or not entry.get("text"):
+                continue
+            expected += 1
+            if cur_map.get(entry["idx"]) == entry["text"]:
+                matched += 1
+        return matched, expected
 
     def solve(self):
         self.logger.info("=== Scrambled Table Solver ===")
@@ -1894,43 +2362,50 @@ class ScrambledTableSolver(BaseSolver):
         if cached_map:
             self.step(f"[CACHE] Using saved table answers ({len(cached_map)} items)")
             self.arrange_cells(cached_map, fast=True)
-            self.click_correction(settle=0.4)
-            if self.get_result_score() >= self.PASS_LINE:
+            self.click_correction()
+            score = self.get_result_score()
+            if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนนตารางเรียงคำ (Cache)", True, f"ได้คะแนน {score}/100")
                 self.record_answer("scrambled-table", cached_map, verified=True)
                 self.logger.info(f"[CACHE] Scrambled table completed in {self.stop_timer()}")
                 return True
             self.logger.warning("[CACHE] Fast cached placement did not pass; retrying reliably")
-            self.click_repeat(settle=0.4)
+            self.click_repeat()
 
         self.click_correction()
-        if not self.click_solution(settle=0.7):
+        if not self.click_solution():
+            self.report_problem("scrambled_table_no_solution")
             self.extract_current_state_answers(verified=False)
             return False
 
         correct_map = self.extract_correct_mapping()
         if not correct_map or all(m.get("text") is None for m in correct_map):
             self.logger.warning("Failed to extract scrambled table mapping")
+            self.report_problem("scrambled_table_extract_empty")
             self.extract_current_state_answers(verified=False)
             return False
-        self.step(f"Extracted {len(correct_map)} items")
-        for entry in correct_map:
-            self.logger.info(f"  item[{entry['idx']}] = {entry['text']}")
 
         self.record_answer("scrambled-table", correct_map, verified=True)
-        self.step("Saved scrambled table to DB")
+        self.verify_step("บันทึกเฉลยตารางเรียงคำลงฐานข้อมูล", True, f"{len(correct_map)} แถว")
 
-        self.click_repeat(settle=0.5)
+        self.click_repeat()
 
         for iteration in range(self.MAX_ITERATIONS):
+            self.arrange_cells(correct_map, fast=(iteration == 0))
+            self.click_correction()
             score = self.get_result_score()
             self.logger.info(f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนนตารางเรียงคำ", True, f"ได้คะแนน {score}/100")
                 elapsed = self.stop_timer()
                 self.logger.info(f"SUCCESS! Time: {elapsed}")
                 return True
-            self.arrange_cells(correct_map, fast=(iteration == 0))
-            self.click_correction(settle=0.4)
-        return self.get_result_score() >= self.PASS_LINE
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat()
+        final_sc = self.get_result_score()
+        ok = final_sc >= self.PASS_LINE
+        self.verify_step("ตรวจคะแนนตารางเรียงคำ", ok, f"ได้คะแนน {final_sc}/100")
+        return ok
 
     def extract_correct_mapping(self):
         try:
@@ -1964,62 +2439,33 @@ class ScrambledTableSolver(BaseSolver):
                 for entry in correct_map
                 if isinstance(entry, dict) and "idx" in entry
             }
-            for entry in correct_map:
-                idx = entry["idx"]
-                target_text = entry["text"]
-                if not target_text or idx >= total_items:
-                    continue
-                target_item = self.page.locator(".exercise-items .item").nth(idx)
-                target_slot = target_item.locator(".scrambled-cell-container").first
-                if target_slot.count() == 0:
-                    continue
-                current = target_slot.locator(".scrambled-cell").first
-                if current.count() > 0:
-                    try:
-                        if current.inner_text().strip() == target_text:
-                            continue
-                    except Exception:
-                        pass
+            for repair_pass in range(2):
+                matched_now, expected_now = self._count_matching_cells(correct_map)
+                if expected_now > 0 and matched_now >= expected_now:
+                    break
 
-                # Prefer cells from outside .item (pool) or from rows not yet holding their own target text
-                source = None
-                pool_cells = self.page.locator(
-                    ".scrambled-cell:not(.exercise-items .item .scrambled-cell)"
-                ).all()
-                for cell in pool_cells:
-                    try:
-                        if cell.inner_text().strip() == target_text:
-                            source = cell
-                            break
-                    except Exception:
+                for entry in correct_map:
+                    idx = entry["idx"]
+                    target_text = entry["text"]
+                    if not target_text or idx >= total_items:
                         continue
-
-                if source is None:
-                    for j in range(total_items):
-                        if j == idx:
-                            continue
-                        other_cell = (
-                            self.page.locator(".exercise-items .item")
-                            .nth(j)
-                            .locator(".scrambled-cell")
-                            .first
-                        )
-                        if other_cell.count() == 0:
-                            continue
+                    target_item = self.page.locator(".exercise-items .item").nth(idx)
+                    target_slot = target_item.locator(".scrambled-cell-container").first
+                    if target_slot.count() == 0:
+                        continue
+                    current = target_slot.locator(".scrambled-cell").first
+                    if current.count() > 0:
                         try:
-                            txt = other_cell.inner_text().strip()
+                            if current.inner_text().strip() == target_text:
+                                continue
                         except Exception:
-                            continue
-                        if txt != target_text:
-                            continue
-                        # Don't steal from a row that already holds its own expected value unless no other match exists
-                        if expected_by_idx.get(j) == txt:
-                            continue
-                        source = other_cell
-                        break
+                            pass
 
-                if source is None:
-                    for cell in self.page.locator(".scrambled-cell").all():
+                    source = None
+                    pool_cells = self.page.locator(
+                        ".scrambled-cell:not(.exercise-items .item .scrambled-cell)"
+                    ).all()
+                    for cell in pool_cells:
                         try:
                             if cell.inner_text().strip() == target_text:
                                 source = cell
@@ -2027,48 +2473,90 @@ class ScrambledTableSolver(BaseSolver):
                         except Exception:
                             continue
 
-                if source is None:
-                    self.logger.warning(f"Cell '{target_text}' not found in DOM")
-                    continue
+                    if source is None:
+                        for j in range(total_items):
+                            if j == idx:
+                                continue
+                            other_cell = (
+                                self.page.locator(".exercise-items .item")
+                                .nth(j)
+                                .locator(".scrambled-cell")
+                                .first
+                            )
+                            if other_cell.count() == 0:
+                                continue
+                            try:
+                                txt = other_cell.inner_text().strip()
+                            except Exception:
+                                continue
+                            if txt != target_text:
+                                continue
+                            if expected_by_idx.get(j) == txt:
+                                continue
+                            source = other_cell
+                            break
 
-                placed = self.fast_drag(source, target_slot) if fast else False
-                if not placed:
-                    placed = self.precise_drag(source, target_slot)
+                    if source is None:
+                        for cell in self.page.locator(".scrambled-cell").all():
+                            try:
+                                if cell.inner_text().strip() == target_text:
+                                    source = cell
+                                    break
+                            except Exception:
+                                continue
 
-                # Verify whether target_slot now holds target_text; if not, try click-swap fallback
-                now_ok = False
-                try:
-                    chk = (
-                        self.page.locator(".exercise-items .item")
-                        .nth(idx)
-                        .locator(".scrambled-cell-container .scrambled-cell")
-                        .first
-                    )
-                    if chk.count() > 0 and chk.inner_text().strip() == target_text:
-                        now_ok = True
-                except Exception:
-                    pass
+                    if source is None:
+                        self.logger.warning(f"Cell '{target_text}' not found in DOM")
+                        continue
 
-                if not now_ok:
+                    placed = self.fast_drag(source, target_slot) if (fast and repair_pass == 0) else False
+                    now_ok = False
                     try:
-                        source.click(timeout=2000)
-                        time.sleep(0.1)
-                        target_slot.click(timeout=2000)
-                        time.sleep(0.15)
-                        placed = True
+                        chk = (
+                            self.page.locator(".exercise-items .item")
+                            .nth(idx)
+                            .locator(".scrambled-cell-container .scrambled-cell")
+                            .first
+                        )
+                        if chk.count() > 0 and chk.inner_text().strip() == target_text:
+                            now_ok = True
                     except Exception:
                         pass
 
-                if placed or now_ok:
-                    moved = True
-                    if not fast:
-                        time.sleep(0.2)
+                    if not now_ok:
+                        try:
+                            source.click(timeout=1500)
+                            time.sleep(0.05)
+                            target_slot.click(timeout=1500)
+                            time.sleep(0.06)
+                            chk = (
+                                self.page.locator(".exercise-items .item")
+                                .nth(idx)
+                                .locator(".scrambled-cell-container .scrambled-cell")
+                                .first
+                            )
+                            now_ok = chk.count() > 0 and chk.inner_text().strip() == target_text
+                        except Exception:
+                            pass
+
+                    if not now_ok:
+                        placed = self.precise_drag(source, target_slot)
+
+                    if placed or now_ok:
+                        moved = True
+
+            matched_final, expected_final = self._count_matching_cells(correct_map)
+            self.verify_step(
+                "ตรวจสอบการวางคำตอบตารางเรียงคำ",
+                matched_final == expected_final and expected_final > 0,
+                f"ครบ {matched_final}/{expected_final} แถว",
+            )
         except Exception as e:
             self.logger.error(f"arrange_cells error: {e}")
         return moved
 
 class SingleChoiceSolver(BaseSolver):
-    MAX_ITERATIONS = 8
+    MAX_ITERATIONS = 5
 
     def extract_current_state_answers(self, verified=True):
         self.capture_initial_context()
@@ -2096,49 +2584,110 @@ class SingleChoiceSolver(BaseSolver):
             )
         return self.record_answer("single-choice", [], verified=False)
 
-    def _apply_cached_answers(self, answers, subtype):
+    def _select_and_verify_single_choices(self, answers, subtype):
         try:
-            if subtype == "legacy":
-                options = self.page.locator(".choice-option").all()
-                if answers and answers[0] < len(options):
-                    inp = options[answers[0]].locator("input.choice").first
-                    if inp.count() > 0:
-                        inp.click(force=True, timeout=3000)
-                        return True
-                return False
+            res = self.page.evaluate(
+                """
+                ([ansList, mode]) => {
+                    const clickRadio = (inp) => {
+                        if (!inp) return false;
+                        if (!inp.checked) {
+                            try { inp.click(); } catch (e) {}
+                        }
+                        if (!inp.checked) {
+                            const lbl = inp.closest('label, .choice-option');
+                            if (lbl) { try { lbl.click(); } catch (e) {} }
+                        }
+                        if (!inp.checked) {
+                            inp.checked = true;
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        return Boolean(inp.checked);
+                    };
 
-            items = self.page.locator(".exercise-items .item.choice-item").all()
-            if not items:
-                return False
+                    if (mode === 'legacy') {
+                        const opts = Array.from(document.querySelectorAll('.choice-option'));
+                        const idx = ansList[0] ?? 0;
+                        const inp = opts[idx] ? opts[idx].querySelector('input.choice') : null;
+                        const ok = clickRadio(inp);
+                        return { matched: ok ? 1 : 0, expected: 1 };
+                    }
 
-            if subtype == "group":
-                idx = answers[0] if answers else 0
-                opts = items[0].locator("input.choice").all()
-                if idx < len(opts):
-                    opts[idx].click(force=True, timeout=3000)
-                    return True
-                return False
+                    if (mode === 'group') {
+                        const allInps = Array.from(document.querySelectorAll('.exercise-items .item.choice-item input.choice'));
+                        const idx = ansList[0] ?? 0;
+                        const ok = clickRadio(allInps[idx]);
+                        return { matched: ok ? 1 : 0, expected: 1 };
+                    }
 
-            for i, idx in enumerate(answers):
-                if i >= len(items):
-                    break
-                opts = items[i].locator("input.choice").all()
-                if idx < len(opts):
-                    try:
-                        opts[idx].click(force=True, timeout=3000)
-                        time.sleep(0.1)
-                    except Exception:
-                        pass
-            return True
+                    const items = Array.from(document.querySelectorAll('.exercise-items .item.choice-item'));
+                    let matched = 0;
+                    const expected = Math.min(ansList.length, items.length);
+                    for (let i = 0; i < expected; i++) {
+                        const opts = Array.from(items[i].querySelectorAll('input.choice'));
+                        const idx = ansList[i];
+                        if (idx >= 0 && idx < opts.length && clickRadio(opts[idx])) {
+                            matched++;
+                        }
+                    }
+                    return { matched, expected };
+                }
+                """,
+                [list(answers), subtype or "multi"],
+            ) or {"matched": 0, "expected": len(answers)}
+
+            matched = int(res.get("matched", 0))
+            expected = int(res.get("expected", len(answers)))
+
+            # Repair any stubborn item via Playwright locator click
+            if matched < expected:
+                if subtype == "legacy":
+                    options = self.page.locator(".choice-option").all()
+                    if answers and answers[0] < len(options):
+                        inp = options[answers[0]].locator("input.choice").first
+                        if inp.count() > 0:
+                            inp.click(force=True, timeout=2000)
+                            matched = 1
+                elif subtype == "group":
+                    opts = self.page.locator(".exercise-items .item.choice-item input.choice").all()
+                    if answers and answers[0] < len(opts):
+                        opts[answers[0]].click(force=True, timeout=2000)
+                        matched = 1
+                else:
+                    items = self.page.locator(".exercise-items .item.choice-item").all()
+                    matched = 0
+                    for i, idx in enumerate(answers):
+                        if i >= len(items):
+                            break
+                        opts = items[i].locator("input.choice").all()
+                        if idx < len(opts):
+                            try:
+                                if not opts[idx].is_checked():
+                                    opts[idx].click(force=True, timeout=2000)
+                                if opts[idx].is_checked():
+                                    matched += 1
+                            except Exception:
+                                pass
+
+            self.verify_step(
+                "เลือกตัวเลือก Single Choice ครบทุกข้อ",
+                matched == expected and expected > 0,
+                f"ครบ {matched}/{expected} ข้อ",
+            )
+            return expected > 0
         except Exception as e:
-            self.logger.error(f"[CACHE] apply failed: {e}")
+            self.logger.error(f"[CHOICE] select_and_verify failed: {e}")
             return False
+
+    def _apply_cached_answers(self, answers, subtype):
+        return self._select_and_verify_single_choices(answers, subtype)
 
     def _save_choice_to_db(self, answers, subtype=None, verified=True):
         try:
             extra = {"subtype": subtype} if subtype else {}
             self.record_answer("single-choice", list(answers), verified=verified, **extra)
-            self.step(f"[DB] Saved single-choice ({subtype or 'multi'}): {answers}")
+            self.verify_step("บันทึกเฉลย Single Choice ลงฐานข้อมูล", verified, f"{len(answers)} ข้อ")
         except Exception as e:
             self.logger.error(f"[DB] Save single-choice failed: {e}")
 
@@ -2163,20 +2712,16 @@ class SingleChoiceSolver(BaseSolver):
                 self.step(f"[CACHE] Found saved answers ({subtype}): {answers}")
                 if self._apply_cached_answers(answers, subtype):
                     self.click_correction()
-                    time.sleep(1)
-                    if self.get_result_score() >= self.PASS_LINE:
+                    score = self.get_result_score()
+                    if score >= self.PASS_LINE:
+                        self.verify_step("ตรวจคะแนน Single Choice (Cache)", True, f"ได้คะแนน {score}/100")
                         self._save_choice_to_db(answers, subtype=subtype, verified=True)
-                        self.step("[CACHE] Passed with cached answers!")
                         return True
                     self.step("[CACHE] Cached answers failed — falling back to solve")
                     self.click_repeat()
-                    time.sleep(1)
 
         self.click_correction()
-        time.sleep(1)
-
         has_solution = self.click_solution()
-        time.sleep(1.5)
 
         try:
             item_count = self.page.locator(".exercise-items .item.choice-item").count()
@@ -2326,11 +2871,11 @@ class SingleChoiceSolver(BaseSolver):
 
     def _solve_multi_item(self, item_count):
         correct_per_item = None
-        for wait in range(3):
+        for _ in range(4):
             correct_per_item = self._find_correct_per_item_js()
-            if correct_per_item and all(c is not None for c in correct_per_item):
+            if correct_per_item and all(c is not None and len(c) > 0 for c in correct_per_item):
                 break
-            time.sleep(0.3)
+            time.sleep(0.1)
         if not correct_per_item or any(c is None for c in correct_per_item):
             correct_per_item = self._find_correct_per_item()
             if not correct_per_item or any(c is None for c in correct_per_item):
@@ -2339,13 +2884,10 @@ class SingleChoiceSolver(BaseSolver):
         normalised = []
         for choices in correct_per_item:
             if isinstance(choices, list):
-                if len(choices) != 1 or not isinstance(choices[0], int):
-                    if len(choices) >= 1 and isinstance(choices[0], int):
-                        choices = choices[0]
-                    else:
-                        return False
-                else:
+                if len(choices) >= 1 and isinstance(choices[0], int):
                     choices = choices[0]
+                else:
+                    return False
             if not isinstance(choices, int):
                 return False
             normalised.append(choices)
@@ -2353,33 +2895,23 @@ class SingleChoiceSolver(BaseSolver):
         self.step(f"Detected correct per item: {correct_per_item}")
         self._save_choice_to_db(correct_per_item, subtype="multi", verified=True)
 
-        if self.get_result_score() >= self.PASS_LINE:
-            return True
-
         self.click_repeat()
-        time.sleep(1)
 
         for iteration in range(self.MAX_ITERATIONS):
+            self._select_and_verify_single_choices(correct_per_item, "multi")
+            self.click_correction()
             score = self.get_result_score()
             self.logger.info(
                 f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนน Single Choice", True, f"ได้คะแนน {score}/100")
                 return True
-            items = self.page.locator(".exercise-items .item.choice-item").all()
-            for item_idx, correct_idx in enumerate(correct_per_item):
-                if correct_idx is None or item_idx >= len(items):
-                    continue
-                item = items[item_idx]
-                opts = item.locator("input.choice").all()
-                if correct_idx < len(opts):
-                    try:
-                        opts[correct_idx].click(force=True, timeout=3000)
-                        time.sleep(0.15)
-                    except Exception:
-                        pass
-            self.click_correction()
-            time.sleep(1)
-        return self.get_result_score() >= self.PASS_LINE
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat()
+        final_sc = self.get_result_score()
+        ok = final_sc >= self.PASS_LINE
+        self.verify_step("ตรวจคะแนน Single Choice", ok, f"ได้คะแนน {final_sc}/100")
+        return ok
 
     def _solve_single_group_choice(self):
         options = self.page.locator(
@@ -2387,7 +2919,7 @@ class SingleChoiceSolver(BaseSolver):
         correct_index = None
         for index, option in enumerate(options):
             try:
-                if option.is_checked(timeout=1000):
+                if option.is_checked(timeout=500):
                     correct_index = index
                     break
             except Exception:
@@ -2398,27 +2930,19 @@ class SingleChoiceSolver(BaseSolver):
         self.step(f'Detected grouped correct option: {correct_index}')
 
         self._save_choice_to_db([correct_index], subtype="group", verified=True)
-
-        if self.get_result_score() >= self.PASS_LINE:
-            return True
         self.click_repeat()
-        time.sleep(1)
+
         for iteration in range(self.MAX_ITERATIONS):
+            self._select_and_verify_single_choices([correct_index], "group")
+            self.click_correction()
             score = self.get_result_score()
             self.logger.info(
                 f'--- Grouped iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---')
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนน Single Choice (Group)", True, f"ได้คะแนน {score}/100")
                 return True
-            current = self.page.locator(
-                '.exercise-items .item.choice-item input.choice').all()
-            if correct_index >= len(current):
-                return False
-            try:
-                current[correct_index].click(force=True, timeout=3000)
-            except Exception:
-                return False
-            self.click_correction()
-            time.sleep(1)
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat()
         return self.get_result_score() >= self.PASS_LINE
 
     def _find_correct_per_item_js(self):
@@ -2563,35 +3087,26 @@ class SingleChoiceSolver(BaseSolver):
 
     def _solve_single_legacy(self):
         correct_idx = None
-        for wait in range(3):
+        for _ in range(4):
             correct_idx = self.find_correct_option()
             if correct_idx is not None:
                 break
-            time.sleep(0.3)
+            time.sleep(0.1)
         if correct_idx is None:
             return False
 
         self._save_choice_to_db([correct_idx], subtype="legacy", verified=True)
-
-        if self.get_result_score() >= self.PASS_LINE:
-            return True
         self.click_repeat()
-        time.sleep(1)
+
         for iteration in range(self.MAX_ITERATIONS):
+            self._select_and_verify_single_choices([correct_idx], "legacy")
+            self.click_correction()
             score = self.get_result_score()
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนน Single Choice (Legacy)", True, f"ได้คะแนน {score}/100")
                 return True
-            options = self.page.locator(".choice-option").all()
-            if correct_idx < len(options):
-                inp = options[correct_idx].locator("input.choice").first
-                if inp.count() > 0:
-                    try:
-                        inp.click(force=True, timeout=3000)
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-            self.click_correction()
-            time.sleep(1)
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat()
         return self.get_result_score() >= self.PASS_LINE
 
     def find_correct_option(self):
@@ -2624,7 +3139,7 @@ class SingleChoiceSolver(BaseSolver):
 
 
 class MultipleChoiceSolver(BaseSolver):
-    MAX_ITERATIONS = 8
+    MAX_ITERATIONS = 5
 
     def extract_current_state_answers(self, verified=True):
         self.capture_initial_context()
@@ -2643,31 +3158,89 @@ class MultipleChoiceSolver(BaseSolver):
                 [list(c) for c in correct_per_item],
                 verified=verified,
             )
-            self.step(f"[DB] Saved multiple-choice: {correct_per_item}")
+            self.verify_step("บันทึกเฉลย Multiple Choice ลงฐานข้อมูล", verified, f"{len(correct_per_item)} ข้อ")
         except Exception as e:
             self.logger.error(f"[DB] Save multiple-choice failed: {e}")
 
-    def _apply_cached_multiple_answers(self, answers):
+    def _select_and_verify_multiple_choices(self, answers):
         try:
-            items = self.page.locator(".exercise-items .item.choice-item").all()
-            if not items:
-                return False
-            for item_idx, correct_indices in enumerate(answers):
-                if item_idx >= len(items):
-                    continue
-                item = items[item_idx]
-                opts = item.locator("input.choice").all()
-                for correct_idx in correct_indices:
-                    if correct_idx < len(opts):
+            res = self.page.evaluate(
+                """
+                (ansPerItem) => {
+                    const items = Array.from(document.querySelectorAll('.exercise-items .item.choice-item'));
+                    if (!items.length) return { matched: 0, expected: 0 };
+                    const toggleCheckbox = (inp, wantChecked) => {
+                        if (!inp) return false;
+                        if (Boolean(inp.checked) !== wantChecked) {
+                            try { inp.click(); } catch (e) {}
+                        }
+                        if (Boolean(inp.checked) !== wantChecked) {
+                            const lbl = inp.closest('label, .choice-option');
+                            if (lbl) { try { lbl.click(); } catch (e) {} }
+                        }
+                        if (Boolean(inp.checked) !== wantChecked) {
+                            inp.checked = wantChecked;
+                            inp.dispatchEvent(new Event('input', { bubbles: true }));
+                            inp.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        return Boolean(inp.checked) === wantChecked;
+                    };
+
+                    let matched = 0;
+                    const expected = Math.min(ansPerItem.length, items.length);
+                    for (let i = 0; i < expected; i++) {
+                        const wantedSet = new Set(Array.isArray(ansPerItem[i]) ? ansPerItem[i] : []);
+                        const opts = Array.from(items[i].querySelectorAll('input.choice'));
+                        let itemOk = true;
+                        for (let k = 0; k < opts.length; k++) {
+                            if (!toggleCheckbox(opts[k], wantedSet.has(k))) {
+                                itemOk = false;
+                            }
+                        }
+                        if (itemOk) matched++;
+                    }
+                    return { matched, expected };
+                }
+                """,
+                list(answers),
+            ) or {"matched": 0, "expected": 0}
+
+            matched = int(res.get("matched", 0))
+            expected = int(res.get("expected", 0))
+
+            if matched < expected:
+                items = self.page.locator(".exercise-items .item.choice-item").all()
+                matched = 0
+                for item_idx, correct_indices in enumerate(answers):
+                    if item_idx >= len(items):
+                        break
+                    wanted = set(correct_indices or [])
+                    opts = items[item_idx].locator("input.choice").all()
+                    item_ok = True
+                    for opt_idx, opt in enumerate(opts):
                         try:
-                            opts[correct_idx].click(force=True, timeout=3000)
-                            time.sleep(0.1)
+                            cur = opt.is_checked()
+                            if cur != (opt_idx in wanted):
+                                opt.click(force=True, timeout=2000)
+                            if opt.is_checked() != (opt_idx in wanted):
+                                item_ok = False
                         except Exception:
-                            pass
-            return True
+                            item_ok = False
+                    if item_ok:
+                        matched += 1
+
+            self.verify_step(
+                "เลือกตัวเลือก Multiple Choice ครบทุกข้อ",
+                matched == expected and expected > 0,
+                f"ครบ {matched}/{expected} ข้อ",
+            )
+            return expected > 0
         except Exception as e:
-            self.logger.error(f"[MULTI] cache apply failed: {e}")
+            self.logger.error(f"[MULTI] select_and_verify failed: {e}")
             return False
+
+    def _apply_cached_multiple_answers(self, answers):
+        return self._select_and_verify_multiple_choices(answers)
 
     def solve(self):
         self.logger.info("=== Multiple Choice Solver ===")
@@ -2687,20 +3260,16 @@ class MultipleChoiceSolver(BaseSolver):
                 self.step(f"[CACHE] Found saved multiple-choice answers: {answers}")
                 if self._apply_cached_multiple_answers(answers):
                     self.click_correction()
-                    time.sleep(1)
-                    if self.get_result_score() >= self.PASS_LINE:
+                    score = self.get_result_score()
+                    if score >= self.PASS_LINE:
+                        self.verify_step("ตรวจคะแนน Multiple Choice (Cache)", True, f"ได้คะแนน {score}/100")
                         self._save_multiple_choice_to_db(answers, verified=True)
-                        self.step("[CACHE] Passed with cached multiple-choice answers!")
                         return True
                     self.step("[CACHE] Cached multiple-choice answers failed — falling back to solve")
                     self.click_repeat()
-                    time.sleep(1)
 
         self.click_correction()
-        time.sleep(1)
-
         has_solution = self.click_solution()
-        time.sleep(2.5)
         try:
             item_count = self.page.locator(".exercise-items .item.choice-item").count()
         except Exception:
@@ -2710,45 +3279,36 @@ class MultipleChoiceSolver(BaseSolver):
             return False
 
         correct_per_item = None
-        for wait in range(3):
+        for _ in range(6):
             correct_per_item = self._find_correct_per_item_js()
             if correct_per_item and any(len(c) > 0 for c in correct_per_item):
                 break
-            time.sleep(0.3)
+            time.sleep(0.12)
 
         if not correct_per_item or all(len(c) == 0 for c in correct_per_item):
             if has_solution:
+                self.report_problem("multiple_choice_extract_empty")
                 self.extract_current_state_answers(verified=False)
                 return False
             self.logger.warning("[MULTI] No revealed solution; falling back to greedy selection")
             return self._solve_without_solution()
 
         self._save_multiple_choice_to_db(correct_per_item, verified=True)
-
-        if self.get_result_score() >= self.PASS_LINE:
-            return True
         self.click_repeat()
-        time.sleep(1)
+
         for iteration in range(self.MAX_ITERATIONS):
+            self._select_and_verify_multiple_choices(correct_per_item)
+            self.click_correction()
             score = self.get_result_score()
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนน Multiple Choice", True, f"ได้คะแนน {score}/100")
                 return True
-            items = self.page.locator(".exercise-items .item.choice-item").all()
-            for item_idx, correct_indices in enumerate(correct_per_item):
-                if not correct_indices or item_idx >= len(items):
-                    continue
-                item = items[item_idx]
-                opts = item.locator("input.choice").all()
-                for correct_idx in correct_indices:
-                    if correct_idx < len(opts):
-                        try:
-                            opts[correct_idx].click(force=True, timeout=3000)
-                            time.sleep(0.1)
-                        except Exception:
-                            pass
-            self.click_correction()
-            time.sleep(1)
-        return self.get_result_score() >= self.PASS_LINE
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat()
+        final_sc = self.get_result_score()
+        ok = final_sc >= self.PASS_LINE
+        self.verify_step("ตรวจคะแนน Multiple Choice", ok, f"ได้คะแนน {final_sc}/100")
+        return ok
 
     def _solve_without_solution(self):
         try:
@@ -2846,7 +3406,7 @@ class MultipleChoiceSolver(BaseSolver):
 
 
 class PictureChoiceSolver(BaseSolver):
-    MAX_ITERATIONS = 20
+    MAX_ITERATIONS = 8
 
     def extract_current_state_answers(self, verified=True):
         self.capture_initial_context()
@@ -2855,6 +3415,30 @@ class PictureChoiceSolver(BaseSolver):
         return self.record_answer(
             "picture-choice", mapping, verified=(verified and has_any)
         )
+
+    def _count_matching_pictures(self, mapping):
+        expected = 0
+        matched = 0
+        items = self.page.locator(".exercise-items .item").all()
+        for entry in mapping:
+            idx = entry["item_idx"]
+            target_src = entry.get("src", "")
+            target_id = entry.get("drag_id", "")
+            if not target_src and not target_id:
+                continue
+            expected += 1
+            if idx < len(items):
+                img = items[idx].locator("img").first
+                if img.count() > 0:
+                    cur_src = img.get_attribute("src") or ""
+                    cur_id = img.get_attribute("data-drag-drop-id") or ""
+                    cur_base = cur_src.rsplit("/", 1)[-1].split("?", 1)[0]
+                    tgt_base = target_src.rsplit("/", 1)[-1].split("?", 1)[0]
+                    if (target_id and cur_id == target_id) or (
+                        target_src and (cur_src == target_src or (tgt_base and cur_base == tgt_base))
+                    ):
+                        matched += 1
+        return matched, expected
 
     def solve(self):
         self.logger.info("=== Picture Choice Solver ===")
@@ -2872,41 +3456,44 @@ class PictureChoiceSolver(BaseSolver):
         if cached_mapping:
             self.step(f"[CACHE] Using saved picture-choice mapping ({len(cached_mapping)} items)")
             self.perform_picture_drag(cached_mapping)
-            time.sleep(1)
             self.click_correction()
-            time.sleep(1)
-            if self.get_result_score() >= self.PASS_LINE:
+            score = self.get_result_score()
+            if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนนจับคู่รูปภาพ (Cache)", True, f"ได้คะแนน {score}/100")
                 self.record_answer("picture-choice", cached_mapping, verified=True)
                 return True
             self.step("[CACHE] Cached picture-choice failed — falling back to solve")
             self.click_repeat()
-            time.sleep(1)
 
         self.click_correction()
-        time.sleep(1)
         if not self.click_solution():
+            self.report_problem("picture_choice_no_solution")
             self.extract_current_state_answers(verified=False)
             return False
-        time.sleep(1.5)
+
         mapping = self.extract_solution_mapping()
         if not mapping or all(not m.get("src") for m in mapping):
+            self.report_problem("picture_choice_extract_empty")
             self.extract_current_state_answers(verified=False)
             return False
 
         self.record_answer("picture-choice", mapping, verified=True)
-        self.step("Saved picture choice mapping to DB")
+        self.verify_step("บันทึกเฉลยจับคู่รูปภาพลงฐานข้อมูล", True, f"{len(mapping)} รูป")
 
         self.click_repeat()
-        time.sleep(1.5)
         for iteration in range(self.MAX_ITERATIONS):
+            self.perform_picture_drag(mapping)
+            self.click_correction()
             score = self.get_result_score()
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนนจับคู่รูปภาพ", True, f"ได้คะแนน {score}/100")
                 return True
-            self.perform_picture_drag(mapping)
-            time.sleep(1)
-            self.click_correction()
-            time.sleep(1)
-        return self.get_result_score() >= self.PASS_LINE
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat()
+        final_sc = self.get_result_score()
+        ok = final_sc >= self.PASS_LINE
+        self.verify_step("ตรวจคะแนนจับคู่รูปภาพ", ok, f"ได้คะแนน {final_sc}/100")
+        return ok
 
     def extract_solution_mapping(self):
         mapping = []
@@ -2960,96 +3547,107 @@ class PictureChoiceSolver(BaseSolver):
         click_placed = 0
         drag_placed = 0
         try:
-            for entry in mapping:
-                idx = entry["item_idx"]
-                target_src = entry.get("src", "")
-                target_id = entry.get("drag_id", "")
-                items = self.page.locator(".exercise-items .item").all()
-                if idx >= len(items) or (not target_src and not target_id):
-                    destination_armed = False
-                    continue
-                item = items[idx]
-                existing_img = item.locator("img").first
-                if existing_img.count() > 0 and target_src:
-                    cur_src = existing_img.get_attribute("src") or ""
-                    cur_base = cur_src.rsplit("/", 1)[-1].split("?", 1)[0]
-                    tgt_base = target_src.rsplit("/", 1)[-1].split("?", 1)[0]
-                    if cur_src == target_src or (tgt_base and cur_base == tgt_base):
+            for repair_pass in range(2):
+                matched_now, expected_now = self._count_matching_pictures(mapping)
+                if expected_now > 0 and matched_now >= expected_now:
+                    break
+
+                for entry in mapping:
+                    idx = entry["item_idx"]
+                    target_src = entry.get("src", "")
+                    target_id = entry.get("drag_id", "")
+                    items = self.page.locator(".exercise-items .item").all()
+                    if idx >= len(items) or (not target_src and not target_id):
                         destination_armed = False
                         continue
-                source = self._find_picture_source(target_src, target_id)
-                if source is None:
-                    destination_armed = False
-                    continue
-                placeholder = item.locator(".drag-drop-placeholder").first
-                target = placeholder if placeholder.count() > 0 else item
-                placed = False
-                used_drag = False
-                try:
-                    if not destination_armed:
-                        target.click(timeout=2500)
-                        destination_armed = True
-                    source.click(timeout=2500)
-                    self.page.wait_for_timeout(180)
+                    item = items[idx]
+                    existing_img = item.locator("img").first
+                    if existing_img.count() > 0 and target_src:
+                        cur_src = existing_img.get_attribute("src") or ""
+                        cur_base = cur_src.rsplit("/", 1)[-1].split("?", 1)[0]
+                        tgt_base = target_src.rsplit("/", 1)[-1].split("?", 1)[0]
+                        if cur_src == target_src or (tgt_base and cur_base == tgt_base):
+                            destination_armed = False
+                            continue
+                    source = self._find_picture_source(target_src, target_id)
+                    if source is None:
+                        destination_armed = False
+                        continue
+                    placeholder = item.locator(".drag-drop-placeholder").first
+                    target = placeholder if placeholder.count() > 0 else item
+                    placed = False
+                    used_drag = False
+                    if repair_pass == 0:
+                        try:
+                            if not destination_armed:
+                                target.click(timeout=2000)
+                                destination_armed = True
+                            source.click(timeout=2000)
+                            time.sleep(0.06)
 
-                    items_now = self.page.locator(".exercise-items .item").all()
-                    if idx < len(items_now):
-                        placed_img = items_now[idx].locator("img").first
-                        placed_src = (placed_img.get_attribute("src") or "") if placed_img.count() else ""
-                        placed = bool(placed_src) and (
-                            placed_src == target_src
-                            or placed_src.rsplit("/", 1)[-1] == target_src.rsplit("/", 1)[-1]
-                        )
+                            items_now = self.page.locator(".exercise-items .item").all()
+                            if idx < len(items_now):
+                                placed_img = items_now[idx].locator("img").first
+                                placed_src = (placed_img.get_attribute("src") or "") if placed_img.count() else ""
+                                placed = bool(placed_src) and (
+                                    placed_src == target_src
+                                    or placed_src.rsplit("/", 1)[-1].split("?", 1)[0]
+                                    == target_src.rsplit("/", 1)[-1].split("?", 1)[0]
+                                )
+                        except Exception as e:
+                            self.logger.debug(f"[PICTURE] Click-to-place failed for item {idx}: {e}")
 
                     if not placed:
+                        destination_armed = False
                         items_now = self.page.locator(".exercise-items .item").all()
-                        if idx < len(items_now):
+                        source_now = self._find_picture_source(target_src, target_id)
+                        if idx < len(items_now) and source_now is not None:
                             target_now = items_now[idx].locator(".drag-drop-placeholder").first
-                            if target_now.count() == 0:
-                                target_now = items_now[idx]
-                            source_now = self._find_picture_source(target_src, target_id)
-                            if source_now is not None:
-                                target_now.click(timeout=1500)
-                                source_now.click(timeout=1500)
-                                self.page.wait_for_timeout(150)
+                            target_now = target_now if target_now.count() > 0 else items_now[idx]
+                            if self.fast_drag(source_now, target_now):
                                 items_after = self.page.locator(".exercise-items .item").all()
                                 if idx < len(items_after):
-                                    placed_img = items_after[idx].locator("img").first
-                                    placed_src = (placed_img.get_attribute("src") or "") if placed_img.count() else ""
-                                    placed = bool(placed_src) and (
-                                        placed_src == target_src
-                                        or placed_src.rsplit("/", 1)[-1] == target_src.rsplit("/", 1)[-1]
+                                    p_img = items_after[idx].locator("img").first
+                                    p_src = (p_img.get_attribute("src") or "") if p_img.count() else ""
+                                    placed = bool(p_src) and (
+                                        p_src == target_src
+                                        or p_src.rsplit("/", 1)[-1].split("?", 1)[0]
+                                        == target_src.rsplit("/", 1)[-1].split("?", 1)[0]
                                     )
-                except Exception as e:
-                    self.logger.debug(f"[PICTURE] Click-to-place failed for item {idx}: {e}")
+                            if not placed:
+                                items_now = self.page.locator(".exercise-items .item").all()
+                                source_now = self._find_picture_source(target_src, target_id)
+                                if idx < len(items_now) and source_now is not None:
+                                    target_now = items_now[idx].locator(".drag-drop-placeholder").first
+                                    target_now = target_now if target_now.count() > 0 else items_now[idx]
+                                    placed = self.precise_drag(source_now, target_now)
+                            if placed:
+                                drag_placed += 1
+                                used_drag = True
+                    if placed:
+                        moved = True
+                        if not used_drag:
+                            click_placed += 1
+                        time.sleep(0.04)
 
-                if not placed:
-                    destination_armed = False
-                    items_now = self.page.locator(".exercise-items .item").all()
-                    source_now = self._find_picture_source(target_src, target_id)
-                    if idx < len(items_now) and source_now is not None:
-                        target_now = items_now[idx].locator(".drag-drop-placeholder").first
-                        target_now = target_now if target_now.count() > 0 else items_now[idx]
-                        placed = self.precise_drag(source_now, target_now)
-                        if placed:
-                            drag_placed += 1
-                            used_drag = True
-                if placed:
-                    moved = True
-                    if not used_drag:
-                        click_placed += 1
-                    time.sleep(0.15)
+            matched_final, expected_final = self._count_matching_pictures(mapping)
+            self.verify_step(
+                "ตรวจสอบการวางรูปภาพครบทุกจุด",
+                matched_final == expected_final and expected_final > 0,
+                f"ครบ {matched_final}/{expected_final} รูป",
+            )
             self.logger.info(
-                "[PICTURE] Placement methods: %s by click, %s by drag fallback",
-                click_placed, drag_placed)
+                "[PICTURE] Placement methods: %s by click, %s by drag fallback (%s/%s verified)",
+                click_placed, drag_placed, matched_final, expected_final,
+            )
         except Exception as e:
             self.logger.error(f"[PICTURE] Placement error: {e}")
         return moved
 
 
 class ToggleSolutionSolver(BaseSolver):
-    MAX_ITERATIONS = 15
-    MAX_TOGGLE_CYCLES = 12
+    MAX_ITERATIONS = 6
+    MAX_TOGGLE_CYCLES = 14
 
     def extract_current_state_answers(self, verified=True):
         self.capture_initial_context()
@@ -3073,93 +3671,130 @@ class ToggleSolutionSolver(BaseSolver):
         cached = self._find_cached_answer(expected_type="toggle-solution")
         cached_answers = cached.get("answers") if isinstance(cached, dict) else None
         if cached_answers:
-            self.step(f"[CACHE] Using saved toggle-solution answers: {cached_answers}")
+            self.step(f"[CACHE] Using saved toggle-solution answers ({len(cached_answers)} gaps)")
             self.set_all_gaps(cached_answers)
-            time.sleep(1)
             self.click_correction()
-            time.sleep(1)
-            if self.get_result_score() >= self.PASS_LINE:
+            score = self.get_result_score()
+            if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนน Toggle Solution (Cache)", True, f"ได้คะแนน {score}/100")
                 self.record_answer("toggle-solution", cached_answers, verified=True)
                 return True
             self.step("[CACHE] Cached toggle-solution failed — falling back to solve")
             self.click_repeat()
-            time.sleep(1)
 
         self.click_correction()
-        time.sleep(1)
         if not self.click_solution():
+            self.report_problem("toggle_solution_no_solution")
             self.extract_current_state_answers(verified=False)
             return False
-        time.sleep(1.5)
+
         correct_answers = self.extract_correct_answers()
         if not correct_answers or all(a == "" for a in correct_answers):
+            self.report_problem("toggle_solution_extract_empty")
             self.extract_current_state_answers(verified=False)
             return False
 
         self.record_answer("toggle-solution", correct_answers, verified=True)
-        self.step("Saved toggle solution answers to DB")
+        self.verify_step("บันทึกเฉลย Toggle Solution ลงฐานข้อมูล", True, f"{len(correct_answers)} จุด")
 
         self.click_repeat()
-        time.sleep(1.5)
         for iteration in range(self.MAX_ITERATIONS):
+            self.set_all_gaps(correct_answers)
+            self.click_correction()
             score = self.get_result_score()
             if score >= self.PASS_LINE:
+                self.verify_step("ตรวจคะแนน Toggle Solution", True, f"ได้คะแนน {score}/100")
                 return True
-            self.set_all_gaps(correct_answers)
-            time.sleep(1)
-            self.click_correction()
-            time.sleep(1)
-        return self.get_result_score() >= self.PASS_LINE
+            if iteration + 1 < self.MAX_ITERATIONS:
+                self.click_repeat()
+        final_sc = self.get_result_score()
+        ok = final_sc >= self.PASS_LINE
+        self.verify_step("ตรวจคะแนน Toggle Solution", ok, f"ได้คะแนน {final_sc}/100")
+        return ok
 
     def _norm(self, s):
         return (s or "").replace("\xa0", " ").strip()
 
     def extract_correct_answers(self):
-        answers = []
         try:
-            gaps = self.page.locator(".exercise-items .gap").all()
-            for g in gaps:
-                answers.append(self._norm(g.inner_text()))
+            return self.page.evaluate("""
+                () => Array.from(document.querySelectorAll('.exercise-items .gap'))
+                    .map(g => (g.innerText || g.textContent || '').replace(/\\u00a0/g, ' ').trim())
+            """) or []
         except Exception:
-            pass
-        return answers
+            return []
 
     def set_all_gaps(self, answers):
+        expected = sum(1 for a in answers if a)
+        if expected == 0:
+            return
         try:
-            total_gaps = self.page.locator(".exercise-items .gap").count()
+            # Fast single-JS cycle pass across all toggle gaps
+            self.page.evaluate(
+                """
+                ([ansList, maxCycles]) => {
+                    const norm = s => (s || '').replace(/\\u00a0/g, ' ').trim();
+                    for (let i = 0; i < ansList.length; i++) {
+                        const wanted = norm(ansList[i]);
+                        if (!wanted) continue;
+                        for (let c = 0; c < maxCycles; c++) {
+                            const gaps = document.querySelectorAll('.exercise-items .gap');
+                            if (i >= gaps.length) break;
+                            const g = gaps[i];
+                            if (norm(g.innerText || g.textContent) === wanted) break;
+                            const cont = g.closest('.gap-container') || g.parentElement;
+                            const btn = cont ? cont.querySelector('button') : null;
+                            if (!btn) break;
+                            try { btn.click(); } catch (e) { break; }
+                        }
+                    }
+                }
+                """,
+                [list(answers), self.MAX_TOGGLE_CYCLES],
+            )
+
+            # Verify every single gap; repair any stubborn gap via Playwright click
+            cur_vals = self.extract_correct_answers()
             for i, ans in enumerate(answers):
-                if i >= total_gaps or not ans:
+                wanted = self._norm(ans)
+                if not wanted:
                     continue
-                for cycle in range(self.MAX_TOGGLE_CYCLES):
+                if i < len(cur_vals) and cur_vals[i] == wanted:
+                    continue
+                for _ in range(self.MAX_TOGGLE_CYCLES):
                     gap = self.page.locator(".exercise-items .gap").nth(i)
                     if gap.count() == 0:
                         break
-                    cur = self._norm(gap.inner_text())
-                    if cur == ans:
+                    if self._norm(gap.inner_text()) == wanted:
                         break
-                    try:
-                        gap.scroll_into_view_if_needed()
-                    except Exception:
-                        pass
                     container = gap.locator(
                         "xpath=ancestor::div[contains(@class,'gap-container')]"
                     ).first
-                    if container.count() == 0:
-                        break
-                    toggle = container.locator("button").first
-                    if toggle.count() == 0:
+                    toggle = container.locator("button").first if container.count() > 0 else None
+                    if toggle is None or toggle.count() == 0:
                         break
                     try:
-                        toggle.click(timeout=2000)
-                        time.sleep(0.15)
+                        toggle.click(timeout=1500)
+                        time.sleep(0.04)
                     except Exception:
                         break
-        except Exception:
-            pass
+
+            final_vals = self.extract_correct_answers()
+            matched = sum(
+                1 for i, ans in enumerate(answers)
+                if self._norm(ans) and i < len(final_vals) and final_vals[i] == self._norm(ans)
+            )
+            self.verify_step(
+                "ตั้งค่าตัวเลือก Toggle ครบทุกจุด",
+                matched == expected,
+                f"ครบ {matched}/{expected} จุด",
+            )
+        except Exception as e:
+            self.logger.error(f"set_all_gaps error: {e}")
 
 
 class MarkTextSolver(BaseSolver):
-    MAX_ITERATIONS = 10
+    MAX_ITERATIONS = 5
 
     def extract_current_state_answers(self, verified=True):
         self.capture_initial_context()
@@ -3192,12 +3827,12 @@ class MarkTextSolver(BaseSolver):
             c_all = cached.get("all_positions") or []
             for pos_list in (c_group, c_all):
                 if pos_list:
-                    self.step(f"[CACHE] Trying saved mark-text positions: {pos_list}")
+                    self.step(f"[CACHE] Trying saved mark-text positions ({len(pos_list)} items)")
                     self.click_by_positions(pos_list)
-                    time.sleep(1)
                     self.click_correction()
-                    time.sleep(1)
-                    if self.get_result_score() >= self.PASS_LINE:
+                    score = self.get_result_score()
+                    if score >= self.PASS_LINE:
+                        self.verify_step("ตรวจคะแนน Mark Text (Cache)", True, f"ได้คะแนน {score}/100")
                         self.record_answer(
                             "mark-text",
                             cached.get("answers", pos_list),
@@ -3208,20 +3843,18 @@ class MarkTextSolver(BaseSolver):
                         )
                         return True
                     self.click_repeat()
-                    time.sleep(1)
 
         self.click_correction()
-        time.sleep(1)
         if not self.click_solution():
+            self.report_problem("mark_text_no_solution")
             self.extract_current_state_answers(verified=False)
             return False
-        time.sleep(2)
+
         group_positions, all_positions, marked_words = self.extract_correct_positions()
         if not group_positions and not all_positions:
+            self.report_problem("mark_text_extract_empty")
             self.extract_current_state_answers(verified=False)
             return False
-        self.step(f"Extracted {len(group_positions)} group positions: {group_positions}")
-        self.step(f"Extracted {len(all_positions)} word positions: {all_positions}")
 
         primary = marked_words if marked_words else (group_positions or all_positions)
         self.record_answer(
@@ -3232,31 +3865,33 @@ class MarkTextSolver(BaseSolver):
             all_positions=all_positions,
             marked_words=marked_words,
         )
-        self.step("Saved mark text positions to DB")
+        self.verify_step("บันทึกเฉลย Mark Text ลงฐานข้อมูล", True, f"{len(group_positions or all_positions)} จุด")
 
         self.click_repeat()
-        time.sleep(1.5)
         for approach in ["group", "all"]:
             positions = group_positions if approach == "group" else all_positions
             if not positions:
                 continue
             self.logger.info(f"--- Trying approach: {approach} ({len(positions)} clicks) ---")
             for iteration in range(self.MAX_ITERATIONS):
+                self.click_by_positions(positions)
+                self.click_correction()
                 score = self.get_result_score()
                 self.logger.info(f"--- Iteration {iteration+1}/{self.MAX_ITERATIONS} | Score: {score} ---")
                 if score >= self.PASS_LINE:
+                    self.verify_step("ตรวจคะแนน Mark Text", True, f"ได้คะแนน {score}/100")
                     elapsed = self.stop_timer()
                     self.logger.info(f"SUCCESS! Time: {elapsed}")
                     return True
-                self.click_by_positions(positions)
-                time.sleep(1)
-                self.click_correction()
-                time.sleep(1)
+                if iteration + 1 < self.MAX_ITERATIONS:
+                    self.click_repeat()
             if self.get_result_score() >= self.PASS_LINE:
                 return True
             self.click_repeat()
-            time.sleep(1.5)
-        return self.get_result_score() >= self.PASS_LINE
+        final_sc = self.get_result_score()
+        ok = final_sc >= self.PASS_LINE
+        self.verify_step("ตรวจคะแนน Mark Text", ok, f"ได้คะแนน {final_sc}/100")
+        return ok
 
     def extract_correct_positions(self):
         try:
@@ -3312,17 +3947,17 @@ class MarkTextSolver(BaseSolver):
 
     def click_by_positions(self, positions):
         try:
-            self.page.evaluate("""
-                () => {
+            res = self.page.evaluate("""
+                (positions) => {
                     const isMarkedNode = (node) => {
                         if (!node) return false;
-                        const cls = (node.className || '').toLowerCase();
+                        const cls = (node.className || '').toString().toLowerCase();
                         return cls.includes('selected') || cls.includes('marked') ||
                                cls.includes('highlight') || cls.includes('chosen') ||
                                cls.includes('active');
                     };
                     const seenGroups = new Set();
-                    const allWords = document.querySelectorAll('.exercise-items .word');
+                    const allWords = Array.from(document.querySelectorAll('.exercise-items .word'));
                     allWords.forEach(w => {
                         const mt = w.closest('.mark-text');
                         if (mt) {
@@ -3335,29 +3970,32 @@ class MarkTextSolver(BaseSolver):
                             try { w.click(); } catch(e) {}
                         }
                     });
-                }
-            """)
-            time.sleep(0.3)
-            clicked = self.page.evaluate("""
-                (positions) => {
-                    const allWords = Array.from(
-                        document.querySelectorAll('.exercise-items .word')
-                    );
+
                     let clickedCount = 0;
+                    let verifiedCount = 0;
                     positions.forEach(idx => {
                         if (idx < allWords.length) {
                             const el = allWords[idx];
                             try {
-                                el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                el.scrollIntoView({ block: 'nearest' });
                                 el.click();
                                 clickedCount++;
+                                const mt = el.closest('.mark-text');
+                                if (isMarkedNode(el) || isMarkedNode(mt)) verifiedCount++;
                             } catch(e) {}
                         }
                     });
-                    return clickedCount;
+                    return { clickedCount, verifiedCount, expected: positions.length };
                 }
-            """, positions)
-            self.step(f"Clicked {clicked} words by position")
+            """, positions) or {}
+            clicked = int(res.get("clickedCount", 0))
+            verified = int(res.get("verifiedCount", clicked))
+            expected = int(res.get("expected", len(positions)))
+            self.verify_step(
+                "คลิกเลือกคำ Mark Text ครบทุกจุด",
+                clicked == expected and expected > 0,
+                f"คลิก {clicked}/{expected} จุด (ไฮไลต์แล้ว {verified})",
+            )
         except Exception as e:
             self.logger.error(f"click_by_positions error: {e}")
 
@@ -3370,8 +4008,14 @@ class PronunciationSolver(BaseSolver):
     _installed_page_ids = set()
     _installed_context_ids = set()
 
-    def __init__(self, page, logger, answer_db=None, page_answer_index=None):
-        super().__init__(page, logger, answer_db=answer_db, page_answer_index=page_answer_index)
+    def __init__(self, page, logger, answer_db=None, page_answer_index=None, diagnostic_cb=None):
+        super().__init__(
+            page,
+            logger,
+            answer_db=answer_db,
+            page_answer_index=page_answer_index,
+            diagnostic_cb=diagnostic_cb,
+        )
         self._item_audio_b64_cache = {}
 
     def _extract_pronunciation_texts(self):
@@ -3804,11 +4448,12 @@ class PronunciationSolver(BaseSolver):
 
 
 class ExerciseEngine:
-    def __init__(self, page, logger, answer_db=None, page_answer_index=None):
+    def __init__(self, page, logger, answer_db=None, page_answer_index=None, diagnostic_cb=None):
         self.page = page
         self.logger = logger
         self.answer_db = answer_db if answer_db is not None else {}
         self.page_answer_index = page_answer_index if page_answer_index is not None else {}
+        self.diagnostic_cb = diagnostic_cb
         self.solvers = {
             "type-drag-drop": DragDropSolver,
             "type-drag-drop-table": DragDropSolver,
@@ -3887,6 +4532,7 @@ class ExerciseEngine:
             self.logger,
             answer_db=self.answer_db,
             page_answer_index=self.page_answer_index,
+            diagnostic_cb=self.diagnostic_cb,
         )
         solver.force_solve = force_solve
         solver.exercise_title = exercise_title or ""
@@ -4989,7 +5635,15 @@ class SpeexxBotCLI:
 
     def setup_logging(self):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_filename = os.path.join(self.logs_folder, f"speexx_{ts}.log")
+        self.session_log_dir = os.path.join(self.logs_folder, f"session_{ts}")
+        self.session_errors_dir = os.path.join(self.session_log_dir, "errors")
+        os.makedirs(self.session_errors_dir, exist_ok=True)
+
+        self.log_filename = os.path.join(self.session_log_dir, "log.txt")
+        self.error_counter = 0
+        self.recent_web_events = []
+        self._attached_diag_pages = set()
+
         self.original_stdout = sys.stdout
         self.tee_logger = TeeLogger(self.log_filename, self.original_stdout)
         sys.stdout = self.tee_logger
@@ -5007,7 +5661,227 @@ class SpeexxBotCLI:
         )
         self.logger.addHandler(handler)
         self.logger.info("Program started")
-        self.logger.info(f"Log: {self.log_filename}")
+        self.logger.info(f"Session log folder: {self.session_log_dir}")
+        self.logger.info(f"Log file: {self.log_filename}")
+
+    def _record_web_event(self, kind, detail):
+        entry = {
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "kind": kind,
+            "detail": str(detail)[:500],
+        }
+        self.recent_web_events.append(entry)
+        if len(self.recent_web_events) > 120:
+            self.recent_web_events = self.recent_web_events[-120:]
+
+    def _attach_web_diagnostics(self, page):
+        if not page:
+            return
+        pid = id(page)
+        if pid in self._attached_diag_pages:
+            return
+        self._attached_diag_pages.add(pid)
+
+        def on_frame_nav(frame):
+            try:
+                if frame == page.main_frame:
+                    u = frame.url or ""
+                    self._record_web_event("NAV", u)
+                    self.logger.info(f"[WEB-NAV] {u}")
+            except Exception:
+                pass
+
+        def on_page_error(err):
+            try:
+                msg = str(err)[:400]
+                self._record_web_event("PAGEERROR", msg)
+                self.logger.warning(f"[WEB-JS-ERROR] {msg}")
+            except Exception:
+                pass
+
+        def on_console(msg):
+            try:
+                mtype = (msg.type or "").lower()
+                if mtype in ("error", "warning"):
+                    txt = (msg.text or "")[:400]
+                    self._record_web_event(f"CONSOLE_{mtype.upper()}", txt)
+                    self.logger.info(f"[WEB-CONSOLE:{mtype}] {txt}")
+            except Exception:
+                pass
+
+        def on_req_failed(req):
+            try:
+                u = req.url or ""
+                if "speexx" in u.lower():
+                    fail_obj = req.failure
+                    fail_str = (
+                        fail_obj.get("errorText")
+                        if isinstance(fail_obj, dict)
+                        else str(fail_obj)
+                    )
+                    detail = f"{req.method} {u} -> {fail_str}"
+                    self._record_web_event("REQ_FAIL", detail)
+                    self.logger.warning(f"[WEB-REQ-FAIL] {detail[:400]}")
+            except Exception:
+                pass
+
+        def on_response(resp):
+            try:
+                st = resp.status
+                u = resp.url or ""
+                if st >= 400 and "speexx" in u.lower():
+                    detail = f"{st} {resp.request.method} {u}"
+                    self._record_web_event("HTTP_ERR", detail)
+                    self.logger.warning(f"[WEB-HTTP-ERR] {detail[:400]}")
+            except Exception:
+                pass
+
+        try:
+            page.on("framenavigated", on_frame_nav)
+            page.on("pageerror", on_page_error)
+            page.on("console", on_console)
+            page.on("requestfailed", on_req_failed)
+            page.on("response", on_response)
+        except Exception as e:
+            self.logger.debug(f"[WEB-DIAG] attach warning: {e}")
+
+    def capture_web_error(
+        self,
+        reason,
+        exercise_title="",
+        page_number=0,
+        exercise_type="",
+        solver_name="",
+        extra=None,
+    ):
+        import traceback as _tb
+
+        self.error_counter += 1
+        now_dt = datetime.now()
+        stamp = now_dt.strftime("%H%M%S")
+        slug = re.sub(r"[^A-Za-z0-9ก-๙._-]+", "_", str(reason or "error")).strip("._")[:48] or "error"
+        err_dir = os.path.join(
+            self.session_errors_dir,
+            f"err_{self.error_counter:03d}_{slug}_{stamp}",
+        )
+        os.makedirs(err_dir, exist_ok=True)
+
+        html_path = os.path.join(err_dir, "errorinwebsite.html")
+        png_path = os.path.join(err_dir, "error.png")
+        json_path = os.path.join(err_dir, "error_details.json")
+
+        latest_html = os.path.join(self.session_log_dir, "errorinwebsite.html")
+        latest_png = os.path.join(self.session_log_dir, "error.png")
+        latest_json = os.path.join(self.session_log_dir, "error_details.json")
+
+        current_url = ""
+        visible_buttons = []
+        body_excerpt = ""
+        saved_html = False
+        saved_png = False
+
+        if self.page:
+            try:
+                current_url = self.page.url or ""
+            except Exception:
+                current_url = ""
+
+            try:
+                dom_meta = self.page.evaluate("""
+                    () => {
+                        const btns = [];
+                        document.querySelectorAll("button, [role='button'], a.btn, .show-more").forEach(b => {
+                            const r = b.getBoundingClientRect();
+                            const st = window.getComputedStyle(b);
+                            if (r.width > 0 && r.height > 0 && st.display !== 'none' && st.visibility !== 'hidden') {
+                                const t = ((b.innerText || b.textContent || '') + ' | aria=' + (b.getAttribute('aria-label') || '') + ' | cls=' + (b.className || '')).replace(/\\s+/g, ' ').trim();
+                                if (t) btns.push(t.slice(0, 140));
+                            }
+                        });
+                        const bodyTxt = document.body ? (document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 1000) : '';
+                        return { btns: btns.slice(0, 30), bodyTxt };
+                    }
+                """) or {}
+                visible_buttons = dom_meta.get("btns") or []
+                body_excerpt = dom_meta.get("bodyTxt") or ""
+            except Exception:
+                pass
+
+            try:
+                raw_html = self.page.content()
+                header_comment = (
+                    f"<!-- SPEEXX DIAGNOSTIC SNAPSHOT\n"
+                    f"  Timestamp : {now_dt.isoformat()}\n"
+                    f"  Reason    : {reason}\n"
+                    f"  URL       : {current_url}\n"
+                    f"  Chapter   : {self.current_chapter_name}\n"
+                    f"  Exercise  : {exercise_title}\n"
+                    f"  Page      : {page_number}\n"
+                    f"  Type      : {exercise_type}\n"
+                    f"  Solver    : {solver_name}\n"
+                    f"-->\n"
+                )
+                full_html = header_comment + raw_html
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(full_html)
+                shutil.copy2(html_path, latest_html)
+                saved_html = True
+            except Exception as e:
+                self.logger.warning(f"[DIAG] Cannot save errorinwebsite.html: {e}")
+
+            try:
+                try:
+                    self.page.screenshot(path=png_path, full_page=True, timeout=5000)
+                except Exception:
+                    self.page.screenshot(path=png_path, full_page=False, timeout=5000)
+                shutil.copy2(png_path, latest_png)
+                saved_png = True
+            except Exception as e:
+                self.logger.warning(f"[DIAG] Cannot save error.png: {e}")
+
+        tb_str = ""
+        exc_info = sys.exc_info()
+        if exc_info and exc_info[0] is not None:
+            tb_str = "".join(_tb.format_exception(*exc_info))
+
+        details = {
+            "error_id": self.error_counter,
+            "timestamp": now_dt.isoformat(),
+            "reason": str(reason),
+            "url": current_url,
+            "chapter_name": self.current_chapter_name,
+            "chapter_cid": self.current_chapter_cid,
+            "exercise_title": exercise_title,
+            "page_number": page_number,
+            "exercise_type": exercise_type,
+            "solver_name": solver_name,
+            "saved_html": saved_html,
+            "saved_png": saved_png,
+            "visible_buttons": visible_buttons,
+            "body_excerpt": body_excerpt,
+            "extra": extra,
+            "traceback": tb_str,
+            "recent_web_events": self.recent_web_events[-40:],
+        }
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(details, f, ensure_ascii=False, indent=2)
+            shutil.copy2(json_path, latest_json)
+        except Exception as e:
+            self.logger.warning(f"[DIAG] Cannot save error_details.json: {e}")
+
+        artifacts = ["log.txt"]
+        if saved_html:
+            artifacts.append("errorinwebsite.html")
+        if saved_png:
+            artifacts.append("error.png")
+        msg = (
+            f"บันทึกไฟล์ตรวจสอบปัญหาแล้ว ({reason}) -> {self.session_log_dir} "
+            f"[{', '.join(artifacts)}]"
+        )
+        print(f"  {Fore.MAGENTA}[DIAG]{Style.RESET_ALL} {msg}")
+        self.logger.warning(f"[DIAG] {msg} | bundle={err_dir}")
+        return err_dir
 
     def clear_screen(self):
         try:
@@ -5324,6 +6198,7 @@ class SpeexxBotCLI:
                     "--use-fake-ui-for-media-stream",
                     "--use-fake-device-for-media-stream",
                     "--autoplay-policy=no-user-gesture-required",
+                    "--mute-audio",
                 ],
             )
             self.browser = self.context.browser
@@ -5331,6 +6206,13 @@ class SpeexxBotCLI:
                 self.page = self.context.pages[0]
             else:
                 self.page = self.context.new_page()
+
+            try:
+                self.context.on("page", self._attach_web_diagnostics)
+            except Exception:
+                pass
+            self._attach_web_diagnostics(self.page)
+            self.print_status("OK", "Browser audio muted (--mute-audio active)")
 
             self._install_pronunciation_init()
 
@@ -6363,75 +7245,152 @@ class SpeexxBotCLI:
 
     def navigate_to_exercise_page(self, num):
         try:
-            items = []
-            for sel in (
-                ".exercises-large-navigation.visible-lg li",
-                ".exercises-large-navigation.visible-md li",
-                ".exercises-large-navigation.visible-sm li",
-                ".exercises-large-navigation li",
-                ".exercises-small-navigation li",
-            ):
-                items = self.page.locator(sel).all()
-                if items:
-                    break
-            if 1 <= num <= len(items):
-                items[num - 1].click()
-                time.sleep(0.5)
+            nav_info = self.page.evaluate(
+                """
+                (targetNum) => {
+                    const sels = [
+                        '.exercises-large-navigation.visible-lg li',
+                        '.exercises-large-navigation.visible-md li',
+                        '.exercises-large-navigation.visible-sm li',
+                        '.exercises-large-navigation li',
+                        '.exercises-small-navigation li'
+                    ];
+                    for (const sel of sels) {
+                        const raw = Array.from(document.querySelectorAll(sel));
+                        const vis = raw.filter(el => {
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 && r.height > 0;
+                        });
+                        const items = vis.length > 0 ? vis : raw;
+                        if (items.length >= targetNum && targetNum >= 1) {
+                            document.querySelectorAll('[data-speexx-nav-target]').forEach(
+                                n => n.removeAttribute('data-speexx-nav-target')
+                            );
+                            const li = items[targetNum - 1];
+                            const cls = ((li.className || '') + ' ' + ((li.querySelector('a,span,div') || {}).className || '')).toLowerCase();
+                            const alreadyActive = cls.includes('active') || cls.includes('current') || cls.includes('selected');
+                            li.setAttribute('data-speexx-nav-target', '1');
+                            return { found: true, alreadyActive, total: items.length };
+                        }
+                    }
+                    return { found: false, alreadyActive: false, total: 0 };
+                }
+                """,
+                int(num),
+            ) or {}
+            if not nav_info.get("found"):
+                return False
+            if nav_info.get("alreadyActive") and num == 1:
                 return True
-            return False
-        except Exception:
+
+            target = self.page.locator("[data-speexx-nav-target='1']").first
+            if target.count() == 0:
+                return False
+            target.click(timeout=3000)
+
+            deadline = time.time() + 3.5
+            while time.time() < deadline:
+                ready = self.page.evaluate(
+                    """
+                    () => {
+                        const ex = document.querySelector('.exercise, .video, video');
+                        if (!ex) return false;
+                        const r = ex.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    }
+                    """
+                )
+                if ready:
+                    break
+                time.sleep(0.06)
+            time.sleep(0.12)
+            return True
+        except Exception as e:
+            self.logger.debug(f"[NAV] navigate_to_exercise_page({num}) error: {e}")
             return False
 
     def detect_completion_modal(self):
         try:
-            circ = self.page.locator(".circliful-and-results").first
-            if circ.count() > 0 and circ.is_visible(timeout=2000):
-                return True
-            next_btn = self.page.locator("#nextButton").first
-            if next_btn.count() > 0 and next_btn.is_visible(timeout=2000):
-                return True
-            repeat_btn = self.page.locator("button.text-button-custom.repeat").first
-            if repeat_btn.count() > 0 and repeat_btn.is_visible(timeout=2000):
-                return True
-            for sel in (
-                "button.block-button.btn-primary.next",
-                "button:has-text('Continue learning')",
-                "button:has-text('เรียนรู้ต่อ')",
-            ):
-                btn = self.page.locator(sel).first
-                if btn.count() > 0 and btn.is_visible(timeout=1000):
-                    return True
-            try:
-                body_text = self.page.locator("body").inner_text(timeout=2000)
-                if "ขั้นตอน" in body_text and (
-                    "ทำได้ดีมาก" in body_text or "ยอดเยี่ยม" in body_text
-                ):
-                    return True
-                body_low = body_text.lower()
-                if "step" in body_low and any(
-                    phrase in body_low
-                    for phrase in (
-                        "well done",
-                        "great job",
-                        "good job",
-                        "congratulations",
-                        "keep it up",
-                        "exercise completed",
-                    )
-                ):
-                    return True
-            except Exception:
-                pass
-            return False
+            return bool(
+                self.page.evaluate(
+                    """
+                    () => {
+                        const isVis = (el) => {
+                            if (!el) return false;
+                            const st = window.getComputedStyle(el);
+                            if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) {
+                                return false;
+                            }
+                            const r = el.getBoundingClientRect();
+                            return r.width > 2 && r.height > 2;
+                        };
+
+                        for (const sel of [
+                            '.circliful-and-results',
+                            '.circliful-container-results',
+                            '.exercise-result-container',
+                            '#nextButton',
+                            'button.block-button.btn-primary.next',
+                            'button.text-button-custom.repeat'
+                        ]) {
+                            const nodes = document.querySelectorAll(sel);
+                            for (const n of nodes) {
+                                if (isVis(n)) return true;
+                            }
+                        }
+
+                        const clickables = document.querySelectorAll(
+                            "button, a, [role='button'], .btn, .block-button"
+                        );
+                        for (const b of clickables) {
+                            if (!isVis(b)) continue;
+                            const txt = (b.innerText || b.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                            if (
+                                txt === 'continue learning' ||
+                                txt === 'เรียนรู้ต่อ' ||
+                                txt === 'next exercise' ||
+                                txt.includes('continue learning') ||
+                                txt.includes('เรียนรู้ต่อ')
+                            ) {
+                                return true;
+                            }
+                        }
+
+                        const bodyText = document.body ? (document.body.innerText || '') : '';
+                        const low = bodyText.toLowerCase();
+                        const hasCongrats = (
+                            bodyText.includes('ทำได้ดีมาก') ||
+                            bodyText.includes('ยอดเยี่ยม') ||
+                            low.includes('great job') ||
+                            low.includes('well done') ||
+                            low.includes('good job') ||
+                            low.includes('congratulations') ||
+                            low.includes('exercise completed')
+                        );
+                        const hasResultCue = (
+                            low.includes('/100') ||
+                            low.includes('continue learning') ||
+                            bodyText.includes('เรียนรู้ต่อ') ||
+                            (low.includes('result') && low.includes('repeat')) ||
+                            (bodyText.includes('ผลลัพธ์') && bodyText.includes('ทำซ้ำ'))
+                        );
+                        return Boolean(hasCongrats && hasResultCue);
+                    }
+                    """
+                )
+            )
         except Exception:
             return False
 
-    def wait_for_completion_modal(self, timeout=20):
-        for i in range(timeout * 2):
+    def wait_for_completion_modal(self, timeout=15):
+        deadline = time.time() + float(timeout)
+        start_t = time.time()
+        while time.time() < deadline:
             if self.detect_completion_modal():
-                self.print_status("OK", f"Completion modal detected (after {i*0.5:.1f}s)")
+                elapsed = time.time() - start_t
+                self.print_status("OK", f"Completion modal detected (after {elapsed:.1f}s)")
                 return True
-            time.sleep(0.5)
+            time.sleep(0.2)
         self.print_status("WAIT", f"Completion modal NOT detected within {timeout}s")
         return False
 
@@ -6456,12 +7415,17 @@ class SpeexxBotCLI:
                 info["progress"] = prog_text.text_content().strip()
             try:
                 body_text = self.page.locator("body").inner_text(timeout=2000)
+                if info["score"] == "N/A":
+                    m_sc = re.search(r"\b(\d{1,3})\s*/\s*(100)\b", body_text)
+                    if m_sc:
+                        info["score"] = m_sc.group(1)
+                        info["score_max"] = m_sc.group(2)
                 for time_pat in (
                     r"เวลา\s+\d+\s*ชม\.\s*\d+\s*น\.",
                     r"เวลา\s+\d+\s*(?:ชม\.|น\.|วินาที)",
                     r"Time(?:\s+spent)?\s*:?\s*\d+\s*h(?:rs?|ours?)?\s*\d+\s*m(?:in(?:s|utes)?)?",
                     r"Time(?:\s+spent)?\s*:?\s*\d+\s*m(?:in(?:s|utes)?)?(?:\s*\d+\s*s(?:ec)?)?",
-                    r"\b\d+\s*h\s*\d+\s*min\b",
+                    r"\b\d+\s*h\s*\d+\s*m(?:in)?\b",
                 ):
                     m = re.search(time_pat, body_text, re.I)
                     if m:
@@ -6470,6 +7434,7 @@ class SpeexxBotCLI:
                 for title_pat in (
                     r"ขั้นตอน\s+\d+\s*[·•:\-]\s*[^\n]+",
                     r"Step\s+\d+\s*[·•:\-]\s*[^\n]+",
+                    r"[·•]\s*[^\n]{3,80}",
                 ):
                     m2 = re.search(title_pat, body_text, re.I)
                     if m2:
@@ -6481,10 +7446,50 @@ class SpeexxBotCLI:
             self.logger.error(f"extract_completion_info error: {e}")
         return info
 
+    def _close_modal_keep_staying(self):
+        """Close a premature completion modal via its X/close button without leaving the exercise."""
+        try:
+            closed = self.page.evaluate(
+                """
+                () => {
+                    const isVis = (el) => {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    for (const sel of [
+                        '.modal .close',
+                        '.modal-dialog .close',
+                        '.circliful-and-results .close',
+                        "button.close",
+                        "[aria-label='Close']",
+                        "[aria-label='ปิด']"
+                    ]) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            if (isVis(el)) {
+                                el.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+                """
+            )
+            if closed:
+                time.sleep(0.25)
+                return not self.detect_completion_modal()
+        except Exception:
+            pass
+        return False
+
     def click_modal_repeat(self):
         try:
             for sel in [
                 "button.text-button-custom.repeat",
+                ".modal button.repeat",
                 "button.repeat",
                 "button:has-text('ทำซ้ำ')",
                 "button:has-text('Repeat')",
@@ -6492,10 +7497,14 @@ class SpeexxBotCLI:
                 "button:has-text('Redo')",
             ]:
                 btn = self.page.locator(sel).first
-                if btn.count() > 0 and btn.is_visible(timeout=2000):
-                    btn.click(timeout=5000, force=True)
+                if btn.count() > 0 and btn.is_visible(timeout=1500):
+                    btn.click(timeout=4000, force=True)
                     self.print_status("OK", f"Clicked [{self.T['repeat']}]")
-                    time.sleep(1.5)
+                    deadline = time.time() + 3.0
+                    while time.time() < deadline:
+                        if not self.detect_completion_modal():
+                            break
+                        time.sleep(0.1)
                     return True
             return False
         except Exception as e:
@@ -6503,25 +7512,148 @@ class SpeexxBotCLI:
             return False
 
     def click_modal_continue(self):
+        prev_url = ""
         try:
-            for sel in [
-                "#nextButton",
-                "button.block-button.btn-primary.next",
-                "button:has-text('เรียนรู้ต่อ')",
-                "button:has-text('Continue learning')",
-                "button:has-text('Continue')",
-                "button:has-text('Next exercise')",
-                "button:has-text('ถัดไป')",
-            ]:
-                btn = self.page.locator(sel).first
-                if btn.count() > 0 and btn.is_visible(timeout=2000):
-                    btn.click(timeout=5000, force=True)
-                    self.print_status("OK", f"Clicked [{self.T['continue']}]")
-                    time.sleep(1.5)
+            prev_url = self.page.url or ""
+        except Exception:
+            pass
+
+        try:
+            for attempt in range(3):
+                target_meta = self.page.evaluate(
+                    """
+                    () => {
+                        document.querySelectorAll('[data-speexx-continue-btn]').forEach(
+                            n => n.removeAttribute('data-speexx-continue-btn')
+                        );
+                        const isVis = (el) => {
+                            if (!el || el.disabled) return false;
+                            const st = window.getComputedStyle(el);
+                            if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) {
+                                return false;
+                            }
+                            const r = el.getBoundingClientRect();
+                            return r.width > 4 && r.height > 4;
+                        };
+
+                        const prioritySelectors = [
+                            '#nextButton',
+                            'button.block-button.btn-primary.next',
+                            '.modal button.btn-primary.next',
+                            '.modal button.next',
+                            'a.block-button.btn-primary.next'
+                        ];
+                        for (const sel of prioritySelectors) {
+                            for (const el of document.querySelectorAll(sel)) {
+                                if (isVis(el)) {
+                                    el.setAttribute('data-speexx-continue-btn', '1');
+                                    const r = el.getBoundingClientRect();
+                                    return {
+                                        found: true,
+                                        label: (el.innerText || el.textContent || sel).trim(),
+                                        cx: r.left + r.width / 2,
+                                        cy: r.top + r.height / 2
+                                    };
+                                }
+                            }
+                        }
+
+                        const candidates = Array.from(document.querySelectorAll(
+                            "button, a, [role='button'], .btn, .block-button, div[class*='button'], span[class*='button']"
+                        ));
+                        const exactPhrases = [
+                            'เรียนรู้ต่อ',
+                            'continue learning',
+                            'next exercise',
+                            'continue',
+                            'ถัดไป'
+                        ];
+                        for (const phrase of exactPhrases) {
+                            for (const el of candidates) {
+                                if (!isVis(el)) continue;
+                                const txt = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                                if (txt === phrase || (phrase.length > 6 && txt.includes(phrase))) {
+                                    el.setAttribute('data-speexx-continue-btn', '1');
+                                    const r = el.getBoundingClientRect();
+                                    return {
+                                        found: true,
+                                        label: (el.innerText || el.textContent || phrase).trim(),
+                                        cx: r.left + r.width / 2,
+                                        cy: r.top + r.height / 2
+                                    };
+                                }
+                            }
+                        }
+                        return { found: false };
+                    }
+                    """
+                ) or {}
+
+                if not target_meta.get("found"):
+                    time.sleep(0.25)
+                    continue
+
+                btn = self.page.locator("[data-speexx-continue-btn='1']").first
+                label = target_meta.get("label") or self.T["continue"]
+                try:
+                    if attempt == 0 and btn.count() > 0:
+                        btn.scroll_into_view_if_needed(timeout=1500)
+                        btn.click(timeout=3500)
+                    elif attempt == 1:
+                        cx = float(target_meta.get("cx") or 0)
+                        cy = float(target_meta.get("cy") or 0)
+                        if cx > 0 and cy > 0:
+                            self.page.mouse.click(cx, cy)
+                        elif btn.count() > 0:
+                            btn.click(timeout=3500, force=True)
+                    else:
+                        if btn.count() > 0:
+                            btn.evaluate("el => el.click()")
+                except Exception as click_err:
+                    self.logger.debug(f"[MODAL] Continue click attempt {attempt+1} error: {click_err}")
+                    try:
+                        if btn.count() > 0:
+                            btn.click(timeout=2500, force=True)
+                    except Exception:
+                        pass
+
+                # Verify that either URL changed OR modal closed!
+                deadline = time.time() + 3.5
+                transitioned = False
+                while time.time() < deadline:
+                    cur_url = ""
+                    try:
+                        cur_url = self.page.url or ""
+                    except Exception:
+                        pass
+                    if (prev_url and cur_url and cur_url != prev_url) or (not self.detect_completion_modal()):
+                        transitioned = True
+                        break
+                    time.sleep(0.12)
+
+                if transitioned:
+                    self.print_status("OK", f"Clicked [{label}] & verified modal transition")
+                    self.logger.info(f"[VERIFY] [OK] กดปุ่ม '{label}' สำเร็จและยืนยันการออกจากหน้าสรุปผลแล้ว")
                     return True
+
+                self.logger.warning(
+                    f"[MODAL] Continue button '{label}' clicked (attempt {attempt+1}/3) "
+                    f"but modal still visible; retrying..."
+                )
+
+            self.capture_web_error(
+                "modal_continue_stuck",
+                exercise_title=self.get_current_exercise_title(),
+                extra={"prev_url": prev_url},
+            )
             return False
         except Exception as e:
             self.print_status("ERROR", f"Continue click failed: {e}")
+            self.capture_web_error(
+                "modal_continue_exception",
+                exercise_title=self.get_current_exercise_title(),
+                extra={"error": str(e)},
+            )
             return False
 
     def _print_summary_report(self, results):
@@ -6569,6 +7701,12 @@ class SpeexxBotCLI:
     def _capture_diagnostic_snapshot(self, title, page_number, exercise_type):
         if not self.page:
             return None
+        err_dir = self.capture_web_error(
+            f"unsupported_or_no_solver_{exercise_type}",
+            exercise_title=title,
+            page_number=page_number,
+            exercise_type=exercise_type,
+        )
         safe = re.sub(r"[^A-Za-z0-9ก-๙._-]+", "_", title).strip("._") or "exercise"
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(
@@ -6578,11 +7716,11 @@ class SpeexxBotCLI:
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(self.page.content())
-            self.logger.warning(f"[DIAGNOSTIC] Snapshot saved: {path}")
+            self.logger.warning(f"[DIAGNOSTIC] Snapshot saved: {path} (bundle={err_dir})")
             return path
         except Exception as e:
             self.logger.warning(f"[DIAGNOSTIC] Snapshot failed: {e}")
-            return None
+            return err_dir
 
     def handle_completion_modal(self, results, skip_summary=False):
         info = self.extract_completion_info()
@@ -6644,28 +7782,46 @@ class SpeexxBotCLI:
 
     def _reset_exercise_page(self):
         try:
-            for sel in [
-                "button.text-button-custom.repeat",
-                "button.action-exercise-button.repeat",
-                "button.repeat",
-                "button:has-text('ทำซ้ำ')",
-                "button:has-text('Repeat')",
-                "button:has-text('Try again')",
-                "button:has-text('Redo')",
-                "[class*='repeat']",
-            ]:
-                try:
-                    btn = self.page.locator(sel).first
-                    if btn.count() > 0 and btn.is_visible(timeout=1500):
-                        btn.scroll_into_view_if_needed()
-                        time.sleep(0.3)
-                        btn.click(timeout=3000, force=True)
-                        self.logger.info(f"[RESET] Clicked repeat via: {sel}")
-                        time.sleep(2)
-                        return True
-                except Exception:
-                    continue
-            self.logger.info("[RESET] No repeat button found")
+            clicked = self.page.evaluate(
+                """
+                () => {
+                    const isVis = (el) => {
+                        if (!el || el.disabled) return false;
+                        if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
+                        const st = window.getComputedStyle(el);
+                        if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    for (const sel of [
+                        'button.action-exercise-button.repeat',
+                        'button.repeat',
+                        "[class*='repeat']"
+                    ]) {
+                        for (const el of document.querySelectorAll(sel)) {
+                            if (isVis(el)) {
+                                el.click();
+                                return sel;
+                            }
+                        }
+                    }
+                    for (const el of document.querySelectorAll('button, [role="button"]')) {
+                        if (!isVis(el)) continue;
+                        const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        if (txt === 'ทำซ้ำ' || txt === 'repeat' || txt === 'try again' || txt === 'redo') {
+                            el.click();
+                            return txt;
+                        }
+                    }
+                    return null;
+                }
+                """
+            )
+            if clicked:
+                self.logger.info(f"[RESET] Clicked repeat via: {clicked}")
+                time.sleep(0.35)
+                return True
+            self.logger.info("[RESET] No page-level repeat button found")
             return False
         except Exception as e:
             self.logger.error(f"[RESET] Error: {e}")
@@ -6673,24 +7829,40 @@ class SpeexxBotCLI:
 
     def _try_skip_to_next_page(self):
         try:
-            for sel in [
-                "button.action-exercise-button.next",
-                "button:has-text('ถัดไป')",
-                "button:has-text('Next')",
-                "#nextButton",
-            ]:
-                try:
-                    btn = self.page.locator(sel).first
-                    if btn.count() > 0 and btn.is_visible(timeout=2000):
-                        btn.scroll_into_view_if_needed()
-                        time.sleep(0.3)
-                        btn.click(timeout=5000, force=True)
-                        self.logger.info(f"[SKIP] Clicked Next via: {sel}")
-                        time.sleep(1.5)
-                        return True
-                except Exception:
-                    continue
-            self.logger.info("[SKIP] No Next button found")
+            clicked = self.page.evaluate(
+                """
+                () => {
+                    const isVis = (el) => {
+                        if (!el || el.disabled) return false;
+                        if (el.closest('.circliful-and-results, .modal, .modal-dialog')) return false;
+                        if (el.id === 'nextButton') return false;
+                        const st = window.getComputedStyle(el);
+                        if (!st || st.display === 'none' || st.visibility === 'hidden') return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                    };
+                    for (const el of document.querySelectorAll('button.action-exercise-button.next')) {
+                        if (isVis(el)) {
+                            el.click();
+                            return 'button.action-exercise-button.next';
+                        }
+                    }
+                    for (const el of document.querySelectorAll('button, [role="button"]')) {
+                        if (!isVis(el)) continue;
+                        const txt = (el.innerText || el.textContent || '').trim().toLowerCase();
+                        if (txt === 'ถัดไป' || txt === 'next') {
+                            el.click();
+                            return txt;
+                        }
+                    }
+                    return null;
+                }
+                """
+            )
+            if clicked:
+                self.logger.info(f"[SKIP] Clicked Next via: {clicked}")
+                time.sleep(0.25)
+                return True
             return False
         except Exception as e:
             self.logger.error(f"[SKIP] Error: {e}")
@@ -6708,43 +7880,15 @@ class SpeexxBotCLI:
             return 0.0
 
     def _auto_dismiss_modal(self):
-        for sel in [
-            ".modal .close",
-            "button.close",
-            "[aria-label='Close']",
-            "[aria-label='ปิด']",
-            ".circliful-and-results .close",
-            "button:has-text('Close')",
-            "button:has-text('ปิด')",
-        ]:
-            try:
-                btn = self.page.locator(sel).first
-                if btn.count() > 0 and btn.is_visible(timeout=1000):
-                    btn.click(timeout=3000, force=True)
-                    self.logger.info(f"[BATCH] Dismissed modal via {sel}")
-                    return True
-            except Exception:
-                continue
-
-        for sel in [
-            "button.block-button.btn-primary.next",
-            "#nextButton",
-            "button:has-text('Continue learning')",
-            "button:has-text('Continue')",
-            "button:has-text('เรียนรู้ต่อ')",
-        ]:
-            try:
-                btn = self.page.locator(sel).first
-                if btn.count() > 0 and btn.is_visible(timeout=1000):
-                    btn.click(timeout=3000, force=True)
-                    self.logger.info(f"[BATCH] Dismissed modal via {sel}")
-                    return True
-            except Exception:
-                continue
-
+        if self._close_modal_keep_staying():
+            self.logger.info("[BATCH] Dismissed modal via close button")
+            return True
+        if self.click_modal_continue():
+            self.logger.info("[BATCH] Dismissed modal via continue button")
+            return True
         try:
             self.page.keyboard.press("Escape")
-            time.sleep(0.5)
+            time.sleep(0.25)
             return True
         except Exception:
             pass
@@ -6943,6 +8087,11 @@ class SpeexxBotCLI:
             if not already_opened and not is_continuation:
                 clicked = self._click_row_safely(title, row_index=row_index)
                 if not clicked:
+                    self.capture_web_error(
+                        "cannot_open_exercise_row",
+                        exercise_title=title,
+                        extra={"row_index": row_index},
+                    )
                     self.print_status(
                         "ERROR",
                         f"Cannot open '{title}' — skipping"
@@ -6970,7 +8119,7 @@ class SpeexxBotCLI:
                                 )
                             except Exception:
                                 pass
-                time.sleep(1.5)
+                time.sleep(0.35)
 
             self._ensure_chapter_db_loaded(announce=False)
 
@@ -6980,20 +8129,20 @@ class SpeexxBotCLI:
                     title = detected_title
 
             if total_pages is None:
-                total_pages = self.get_total_exercises()
+                total_pages = self.get_total_exercises(retries=3, wait_seconds=0.6)
 
             if total_pages == 0:
                 if "/results" in (self.page.url or "").lower():
                     self.logger.warning("[TOTAL] Still on /results (total=0), re-selecting chapter & clicking row...")
                     if self._click_row_safely(title, row_index=row_index, click_inner_cell=True):
-                        time.sleep(2)
-                        total_pages = self.get_total_exercises()
+                        time.sleep(0.8)
+                        total_pages = self.get_total_exercises(retries=3, wait_seconds=0.6)
                 else:
                     self.logger.warning("[TOTAL] First attempt = 0, retrying with reload...")
                     try:
                         self.page.reload(wait_until="domcontentloaded", timeout=15000)
-                        time.sleep(2)
-                        total_pages = self.get_total_exercises()
+                        time.sleep(0.8)
+                        total_pages = self.get_total_exercises(retries=3, wait_seconds=0.6)
                     except Exception as e:
                         self.logger.error(f"[TOTAL] Reload failed: {e}")
 
@@ -7006,6 +8155,10 @@ class SpeexxBotCLI:
                     pass
 
             if total_pages == 0:
+                self.capture_web_error(
+                    "cannot_determine_total_pages",
+                    exercise_title=title,
+                )
                 self.print_status("ERROR", "Cannot determine total.")
                 if not batch_mode:
                     self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
@@ -7026,24 +8179,60 @@ class SpeexxBotCLI:
                 return (final_status, final_score, final_elapsed)
 
             effective_force = self.force_solve_all
+            captured_page_errors = set()
+
+            def _solver_diag_cb(reason, **kw):
+                pnum = int(kw.get("page_number") or 0)
+                captured_page_errors.add(pnum)
+                self.capture_web_error(
+                    reason,
+                    exercise_title=kw.get("exercise_title") or title,
+                    page_number=pnum,
+                    solver_name=kw.get("solver") or "",
+                    extra=kw.get("extra"),
+                )
 
             engine = ExerciseEngine(
                 self.page,
                 self.logger,
                 answer_db=self.answer_db,
                 page_answer_index=self.page_answer_index,
+                diagnostic_cb=_solver_diag_cb,
             )
             results = []
             all_success = True
             has_skipped = False
+            early_modal_completed = False
             PASS_LINE = 51
             MAX_TIME_PER_PAGE = 300
 
-            for i in pages_to_solve:
+            for idx_pos, i in enumerate(pages_to_solve):
+                # Check if Speexx already popped up the Completion Modal (e.g. remaining pages were already green!)
+                if self.detect_completion_modal():
+                    if not effective_force:
+                        self.logger.info(
+                            f"[VERIFY] [OK] Speexx เปิดหน้าสรุปผล Completion Modal ก่อนหน้า {i}/{total_pages} "
+                            f"(หน้าถัดไปผ่านครบแล้ว) — ข้ามไปยังขั้นตอนกด Continue ทันที"
+                        )
+                        early_modal_completed = True
+                        break
+                    else:
+                        self._close_modal_keep_staying()
+
                 if total_pages > 1:
-                    self.navigate_to_exercise_page(i)
-                    time.sleep(1)
+                    nav_ok = self.navigate_to_exercise_page(i)
+                    if not nav_ok and self.detect_completion_modal() and not effective_force:
+                        self.logger.info(
+                            f"[VERIFY] [OK] Completion Modal ปรากฏขณะสลับไปหน้า {i}/{total_pages}"
+                        )
+                        early_modal_completed = True
+                        break
+
                 et = engine.detect_type()
+                if et == "unknown" and self.detect_completion_modal() and not effective_force:
+                    early_modal_completed = True
+                    break
+
                 self.print_status("PAGE", f"{self.T['page']} {i}/{total_pages} | {self.T['type']}: {et}")
 
                 if et in UNSUPPORTED_TYPES:
@@ -7067,8 +8256,8 @@ class SpeexxBotCLI:
                         )
                     results.append((i, "SKIPPED", 0, "N/A"))
                     has_skipped = True
-                    self._try_skip_to_next_page()
-                    time.sleep(1)
+                    if idx_pos == len(pages_to_solve) - 1:
+                        self._try_skip_to_next_page()
                     continue
 
                 solver = engine.get_solver(
@@ -7109,6 +8298,14 @@ class SpeexxBotCLI:
                         solver.solve()
                     except Exception as e:
                         self.print_status("ERROR", f"Video solver error: {e}")
+                        self.capture_web_error(
+                            "video_solver_exception",
+                            exercise_title=title,
+                            page_number=i,
+                            exercise_type=et,
+                            solver_name="VideoSolver",
+                            extra={"error": str(e)},
+                        )
                     self._record_page_to_db(
                         title,
                         i,
@@ -7122,12 +8319,13 @@ class SpeexxBotCLI:
                     elapsed = solver.stop_timer() if solver.start_time else "N/A"
                     self.print_status("RESULT", f"{self.T['page']} {i}: {self.T['success']} (video) | {elapsed}")
                     results.append((i, "SUCCESS", 100, elapsed))
-                    self._try_skip_to_next_page()
+                    if idx_pos == len(pages_to_solve) - 1:
+                        self._try_skip_to_next_page()
                     continue
 
                 if not effective_force:
                     try:
-                        existing_score = solver.get_result_score()
+                        existing_score = solver.get_result_score(wait_for_score=False)
                     except Exception:
                         existing_score = 0
 
@@ -7152,7 +8350,8 @@ class SpeexxBotCLI:
                             f"({existing_score}) [already passed]"
                         )
                         results.append((i, "SUCCESS", existing_score, "0.00s"))
-                        self._try_skip_to_next_page()
+                        if idx_pos == len(pages_to_solve) - 1:
+                            self._try_skip_to_next_page()
                         continue
                 else:
                     self.logger.info(
@@ -7180,10 +8379,29 @@ class SpeexxBotCLI:
                         success = solver.solve()
                     except Exception as e:
                         self.print_status("ERROR", f"Solver error: {str(e)}")
+                        self.capture_web_error(
+                            "solver_exception",
+                            exercise_title=title,
+                            page_number=i,
+                            exercise_type=et,
+                            solver_name=type(solver).__name__,
+                            extra={"error": str(e)},
+                        )
+                        captured_page_errors.add(i)
                         success = False
 
                     elapsed = solver.stop_timer() if solver.start_time else "N/A"
-                    score = solver.get_result_score()
+                    # If Speexx immediately popped up the completion modal upon passing this page:
+                    if self.detect_completion_modal():
+                        info_now = self.extract_completion_info()
+                        try:
+                            modal_sc = int(str(info_now.get("score", "100")).strip())
+                        except Exception:
+                            modal_sc = 100
+                        score = max(score, modal_sc, page_pass_line if success else 0)
+                    else:
+                        score = solver.get_result_score(wait_for_score=False)
+
                     if score > best_score:
                         best_score = score
 
@@ -7225,15 +8443,35 @@ class SpeexxBotCLI:
                 pages_recorded_count += 1
 
                 if passed_page:
+                    self.logger.info(
+                        f"[VERIFY] [OK] หน้า {i}/{total_pages} ({et}) ผ่านเกณฑ์ด้วยคะแนน {score}/100 ({elapsed})"
+                    )
                     self.print_status("RESULT", f"{self.T['page']} {i}: {self.T['success']} ({score}) | {elapsed}")
                     results.append((i, "SUCCESS", score, elapsed))
-                    self._try_skip_to_next_page()
+                    if self.detect_completion_modal():
+                        if not effective_force or idx_pos == len(pages_to_solve) - 1:
+                            early_modal_completed = True
+                            break
+                        else:
+                            self._close_modal_keep_staying()
+                    elif idx_pos == len(pages_to_solve) - 1:
+                        self._try_skip_to_next_page()
                 else:
+                    if i not in captured_page_errors:
+                        self.capture_web_error(
+                            f"page_score_below_pass_{best_score}",
+                            exercise_title=title,
+                            page_number=i,
+                            exercise_type=et,
+                            solver_name=type(solver).__name__,
+                            extra={"best_score": best_score, "pass_line": page_pass_line},
+                        )
+                        captured_page_errors.add(i)
                     self.print_status("ERROR", f"{self.T['page']} {i}: {self.T['failed']} (Score: {best_score}) | {elapsed}")
                     results.append((i, "FAILED", best_score, elapsed))
                     all_success = False
-                    self._try_skip_to_next_page()
-                    time.sleep(1)
+                    if idx_pos == len(pages_to_solve) - 1:
+                        self._try_skip_to_next_page()
 
             self._print_summary_report(results)
 
@@ -7266,7 +8504,7 @@ class SpeexxBotCLI:
                 try:
                     if self.detect_completion_modal():
                         self._auto_dismiss_modal()
-                        time.sleep(1)
+                        time.sleep(0.5)
                 except Exception:
                     pass
                 return (final_status, final_score, final_elapsed)
@@ -7276,126 +8514,138 @@ class SpeexxBotCLI:
                 self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
                 return (final_status, final_score, final_elapsed)
 
-            if all_success:
-                if self.wait_for_completion_modal(timeout=20):
-                    previous_url = self.page.url
-                    previous_title = self.get_current_exercise_title()
-                    if auto_continue:
-                        if continuation_depth >= self.MAX_NEW_EXERCISE_CHAIN:
-                            self.print_status(
-                                "ERROR",
-                                self.T["stop_chain_limit"].format(self.MAX_NEW_EXERCISE_CHAIN),
-                            )
-                            return (final_status, final_score, final_elapsed)
-                        action = "continue" if self.click_modal_continue() else "none"
-                    else:
-                        action = self.handle_completion_modal(results, skip_summary=True)
-                    if action == "repeat":
-                        self.print_status("INFO", "Restarting packet (Repeat)...")
-                        time.sleep(1.5)
-                        try:
-                            self.navigate_to_exercise_page(1)
-                            time.sleep(1)
-                        except Exception:
-                            pass
-                        return self.auto_solve_exercise(
-                            title, selected_pages=None,
-                            is_continuation=True, already_opened=True,
-                            total_pages=total_pages,
+            # Check for Completion Modal regardless of whether all_success had a transient hiccup!
+            modal_ready = early_modal_completed or self.detect_completion_modal()
+            if not modal_ready:
+                modal_wait_secs = 14 if all_success else 3
+                modal_ready = self.wait_for_completion_modal(timeout=modal_wait_secs)
+
+            if modal_ready:
+                modal_info = self.extract_completion_info()
+                self.logger.info(
+                    f"[VERIFY] [OK] ยืนยันหน้าสรุปผล Completion Modal: score={modal_info.get('score')}/{modal_info.get('score_max')} "
+                    f"title={modal_info.get('title')} time={modal_info.get('time')}"
+                )
+                if final_status != "SUCCESS":
+                    try:
+                        msc = int(str(modal_info.get("score") or "0").strip())
+                        if msc >= PASS_LINE:
+                            final_status = "SUCCESS"
+                            final_score = max(final_score, msc)
+                    except Exception:
+                        pass
+
+                previous_url = self.page.url
+                previous_title = self.get_current_exercise_title()
+                if auto_continue:
+                    if continuation_depth >= self.MAX_NEW_EXERCISE_CHAIN:
+                        self.print_status(
+                            "ERROR",
+                            self.T["stop_chain_limit"].format(self.MAX_NEW_EXERCISE_CHAIN),
                         )
-                    elif action == "continue":
-                        self.print_status("OK", "Moving on (Continue)...")
-                        time.sleep(2)
-                        try:
-                            if auto_continue:
-                                self.page.wait_for_function(
-                                    """
-                                    (previous) => {
-                                        if (window.location.href !== previous.url) return true;
-                                        const selectors = [
-                                            '.folders-dropdown .title span',
-                                            '.instructions-text',
-                                            'h1.exercise-header'
-                                        ];
-                                        return selectors.some(selector => {
-                                            const element = document.querySelector(selector);
-                                            return element && element.textContent.trim() &&
-                                                element.textContent.trim() !== previous.title;
-                                        });
-                                    }
-                                    """,
-                                    arg={"url": previous_url, "title": previous_title},
-                                    timeout=15000,
-                                )
-                                if "/results" in self.page.url.lower():
-                                    return self._continue_auto_from_results(
-                                        title, final_status, final_score,
-                                        final_elapsed, chain_seen_titles,
-                                        continuation_depth,
-                                    )
-                            self.page.wait_for_selector(
-                                ".exercise, .video",
-                                state="visible",
-                                timeout=10000
-                            )
-                            new_total = self.get_total_exercises(
-                                retries=2 if auto_continue else 4,
-                                wait_seconds=0.75 if auto_continue else 1.5,
-                            )
-                            new_title = self.get_current_exercise_title()
-                            if auto_continue and new_total == 0:
-                                return self._continue_auto_from_results(
-                                    title, final_status, final_score,
-                                    final_elapsed, chain_seen_titles,
-                                    continuation_depth,
-                                )
-                            if (auto_continue and self.page.url == previous_url and
-                                    new_title == previous_title):
-                                self.print_status("WAIT", self.T["stop_same_page"])
-                                return (final_status, final_score, final_elapsed)
-
-                            if auto_continue and new_title.casefold() in chain_seen_titles:
-                                self.print_status("OK", self.T["stop_loop_detected"])
-                                return (final_status, final_score, final_elapsed)
-
-                            self.print_status("OK", f"New exercise loaded: {new_title} ({new_total} pages)")
-                            return self.auto_solve_exercise(
-                                new_title, selected_pages=None,
-                                is_continuation=True, already_opened=True,
-                                total_pages=new_total,
-                                auto_continue=auto_continue,
-                                continuation_depth=continuation_depth + 1,
-                                chain_seen_titles=chain_seen_titles,
-                            )
-                        except Exception as e:
-                            if auto_continue:
-                                self.logger.warning(
-                                    f"[CONTINUE] Direct exercise navigation failed; "
-                                    f"trying Results fallback: {e}"
-                                )
-                                return self._continue_auto_from_results(
-                                    title, final_status, final_score,
-                                    final_elapsed, chain_seen_titles,
-                                    continuation_depth,
-                                )
-                            self.print_status("WAIT", self.T["new_page_not_loaded"].format(e))
-                            return (final_status, final_score, final_elapsed)
-                    else:
+                        return (final_status, final_score, final_elapsed)
+                    action = "continue" if self.click_modal_continue() else "none"
+                else:
+                    action = self.handle_completion_modal(results, skip_summary=True)
+                if action == "repeat":
+                    self.print_status("INFO", "Restarting packet (Repeat)...")
+                    time.sleep(0.8)
+                    try:
+                        self.navigate_to_exercise_page(1)
+                    except Exception:
+                        pass
+                    return self.auto_solve_exercise(
+                        title, selected_pages=None,
+                        is_continuation=True, already_opened=True,
+                        total_pages=total_pages,
+                    )
+                elif action == "continue":
+                    self.print_status("OK", "Moving on (Continue)...")
+                    time.sleep(0.6)
+                    try:
                         if auto_continue:
+                            self.page.wait_for_function(
+                                """
+                                (previous) => {
+                                    if (window.location.href !== previous.url) return true;
+                                    const selectors = [
+                                        '.folders-dropdown .title span',
+                                        '.instructions-text',
+                                        'h1.exercise-header'
+                                    ];
+                                    return selectors.some(selector => {
+                                        const element = document.querySelector(selector);
+                                        return element && element.textContent.trim() &&
+                                            element.textContent.trim() !== previous.title;
+                                    });
+                                }
+                                """,
+                                arg={"url": previous_url, "title": previous_title},
+                                timeout=12000,
+                            )
+                            if "/results" in self.page.url.lower():
+                                self.logger.info("[VERIFY] [OK] เปลี่ยนกลับหน้า /results เพื่อเลือกแบบฝึกหัดถัดไป")
+                                return self._continue_auto_from_results(
+                                    title, final_status, final_score,
+                                    final_elapsed, chain_seen_titles,
+                                    continuation_depth,
+                                )
+                        self.page.wait_for_selector(
+                            ".exercise, .video",
+                            state="visible",
+                            timeout=10000
+                        )
+                        new_total = self.get_total_exercises(
+                            retries=2 if auto_continue else 3,
+                            wait_seconds=0.5 if auto_continue else 1.0,
+                        )
+                        new_title = self.get_current_exercise_title()
+                        if auto_continue and new_total == 0:
                             return self._continue_auto_from_results(
                                 title, final_status, final_score,
                                 final_elapsed, chain_seen_titles,
                                 continuation_depth,
                             )
+                        if (auto_continue and self.page.url == previous_url and
+                                new_title == previous_title):
+                            self.logger.warning("[CONTINUE] Still on same exercise after Continue; falling back to /results")
+                            return self._continue_auto_from_results(
+                                title, final_status, final_score,
+                                final_elapsed, chain_seen_titles,
+                                continuation_depth,
+                            )
+
+                        if auto_continue and new_title.casefold() in chain_seen_titles:
+                            self.print_status("OK", self.T["stop_loop_detected"])
+                            return (final_status, final_score, final_elapsed)
+
+                        self.logger.info(
+                            f"[VERIFY] [OK] เข้าสู่แบบฝึกหัดถัดไปสำเร็จ: {new_title} ({new_total} หน้า)"
+                        )
+                        self.print_status("OK", f"New exercise loaded: {new_title} ({new_total} pages)")
+                        return self.auto_solve_exercise(
+                            new_title, selected_pages=None,
+                            is_continuation=True, already_opened=True,
+                            total_pages=new_total,
+                            auto_continue=auto_continue,
+                            continuation_depth=continuation_depth + 1,
+                            chain_seen_titles=chain_seen_titles,
+                        )
+                    except Exception as e:
+                        if auto_continue:
+                            self.logger.warning(
+                                f"[CONTINUE] Direct exercise navigation failed; "
+                                f"trying Results fallback: {e}"
+                            )
+                            return self._continue_auto_from_results(
+                                title, final_status, final_score,
+                                final_elapsed, chain_seen_titles,
+                                continuation_depth,
+                            )
+                        self.print_status("WAIT", self.T["new_page_not_loaded"].format(e))
                         return (final_status, final_score, final_elapsed)
                 else:
                     if auto_continue:
-                        if continuation_depth >= self.MAX_NEW_EXERCISE_CHAIN:
-                            self.print_status(
-                                "ERROR",
-                                self.T["stop_chain_limit"].format(self.MAX_NEW_EXERCISE_CHAIN),
-                            )
-                            return (final_status, final_score, final_elapsed)
                         return self._continue_auto_from_results(
                             title, final_status, final_score,
                             final_elapsed, chain_seen_titles,
@@ -7403,10 +8653,27 @@ class SpeexxBotCLI:
                         )
                     return (final_status, final_score, final_elapsed)
             else:
+                if auto_continue:
+                    if continuation_depth >= self.MAX_NEW_EXERCISE_CHAIN:
+                        self.print_status(
+                            "ERROR",
+                            self.T["stop_chain_limit"].format(self.MAX_NEW_EXERCISE_CHAIN),
+                        )
+                        return (final_status, final_score, final_elapsed)
+                    return self._continue_auto_from_results(
+                        title, final_status, final_score,
+                        final_elapsed, chain_seen_titles,
+                        continuation_depth,
+                    )
                 return (final_status, final_score, final_elapsed)
 
         except Exception as e:
             self.print_status("ERROR", f"Auto solve error: {str(e)}")
+            self.capture_web_error(
+                "auto_solve_unhandled_exception",
+                exercise_title=title,
+                extra={"error": str(e)},
+            )
         finally:
             try:
                 if pages_recorded_count > 0 or self.answer_db or self.structured_page_records:
