@@ -109,6 +109,66 @@ class ModalAndPageMixin:
         )
         return 0
 
+    def wait_for_exercise_content_ready(self, timeout=6.0):
+        """Wait until the current exercise page has mounted its real type-* class and interactive DOM (or real <video>)."""
+        deadline = time.time() + float(timeout)
+        start_ts = time.time()
+        while time.time() < deadline:
+            try:
+                ready = bool(
+                    self.page.evaluate(
+                        """
+                        (elapsedSec) => {
+                            const isVis = (el) => {
+                                if (!el) return false;
+                                const st = window.getComputedStyle(el);
+                                if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) {
+                                    return false;
+                                }
+                                const r = el.getBoundingClientRect();
+                                return r.width > 4 && r.height > 4;
+                            };
+
+                            const exList = Array.from(document.querySelectorAll('.exercise'));
+                            const visEx = exList.find(isVis) || exList[0] || null;
+                            const cls = visEx ? (visEx.getAttribute('class') || '') : '';
+                            const hasTypeClass = /\\btype-[a-z-]+/.test(cls) || cls.includes('pronunciation');
+
+                            if (hasTypeClass) {
+                                if (cls.includes('type-intro') || cls.includes('type-video')) {
+                                    return true;
+                                }
+                                const hasInner = Boolean(
+                                    document.querySelector(
+                                        '.exercise-items .item, .exercise-items input, .exercise-items .drag-drop-placeholder, ' +
+                                        '.exercise-items .drag-drop, .exercise-items .gap, .exercise-items .word, ' +
+                                        '.draggable-container .drag-drop, button.start-exercise, [class*="pronunciation"]'
+                                    )
+                                );
+                                if (hasInner) return true;
+                                if (elapsedSec >= 2.8 && document.querySelector('.exercise-items')) return true;
+                            }
+
+                            if (elapsedSec >= 1.2) {
+                                const hasVisVideo = Array.from(document.querySelectorAll('video')).some(v => {
+                                    if (!isVis(v)) return false;
+                                    return Boolean(v.currentSrc || v.src || v.getAttribute('src') || v.querySelector('source[src]') || v.readyState > 0);
+                                });
+                                if (hasVisVideo) return true;
+                            }
+                            return false;
+                        }
+                        """,
+                        time.time() - start_ts,
+                    )
+                )
+                if ready:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return False
+
     def navigate_to_exercise_page(self, num):
         try:
             nav_info = self.page.evaluate(
@@ -147,29 +207,32 @@ class ModalAndPageMixin:
             if not nav_info.get("found"):
                 return False
             if nav_info.get("alreadyActive") and num == 1:
+                self.wait_for_exercise_content_ready(timeout=6.0)
                 return True
+
+            prev_url = ""
+            try:
+                prev_url = self.page.url or ""
+            except Exception:
+                pass
 
             target = self.page.locator("[data-speexx-nav-target='1']").first
             if target.count() == 0:
                 return False
             target.click(timeout=3000)
 
-            deadline = time.time() + 3.5
-            while time.time() < deadline:
-                ready = self.page.evaluate(
-                    """
-                    () => {
-                        const ex = document.querySelector('.exercise, .video, video');
-                        if (!ex) return false;
-                        const r = ex.getBoundingClientRect();
-                        return r.width > 0 && r.height > 0;
-                    }
-                    """
-                )
-                if ready:
-                    break
-                time.sleep(0.06)
-            time.sleep(0.12)
+            # Wait briefly for route `/exercise/<num>` update when SPA uses numbered exercise URLs
+            if "/exercise/" in prev_url:
+                url_deadline = time.time() + 2.5
+                expected_suffix = f"/exercise/{int(num)}"
+                while time.time() < url_deadline:
+                    cur_u = (self.page.url or "").split("?")[0]
+                    if cur_u.endswith(expected_suffix):
+                        break
+                    time.sleep(0.06)
+
+            self.wait_for_exercise_content_ready(timeout=5.5)
+            time.sleep(0.1)
             return True
         except Exception as e:
             self.logger.debug(f"[NAV] navigate_to_exercise_page({num}) error: {e}")
@@ -259,11 +322,11 @@ class ModalAndPageMixin:
         if not url:
             return ""
         clean = str(url).split("?", 1)[0].split("#", 1)[0].rstrip("/")
-        m = re.search(r"((?:standard|classroom|video|audio|test|custom)?-?packet/\d+|/packets?/\d+)", clean, re.I)
+        m = re.search(r"([a-z0-9_-]*packet/\d+|/packets?/\d+)", clean, re.I)
         if m:
             return m.group(1).strip("/").lower()
         clean = re.sub(r"/exercise/\d+$", "", clean, flags=re.I)
-        if "/results" in clean.lower():
+        if clean.lower().endswith("/results") or "/results/" in clean.lower():
             return ""
         return clean.lower()
 
@@ -271,7 +334,7 @@ class ModalAndPageMixin:
         deadline = time.time() + float(timeout)
         start_t = time.time()
         while time.time() < deadline:
-            if "/results" in (self.page.url or "").lower():
+            if self._is_on_results_page():
                 return False
             if self.detect_completion_modal():
                 elapsed = time.time() - start_t
@@ -281,7 +344,63 @@ class ModalAndPageMixin:
         self.print_status("WAIT", f"Completion modal NOT detected within {timeout}s")
         return False
 
+    def wait_for_modal_settled(self, timeout=5.0):
+        """Wait for Completion Modal loading spinner to finish and score + #nextButton to hydrate."""
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            try:
+                settled = bool(
+                    self.page.evaluate(
+                        """
+                        () => {
+                            const isVis = (el) => {
+                                if (!el) return false;
+                                const st = window.getComputedStyle(el);
+                                if (!st || st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0) {
+                                    return false;
+                                }
+                                const r = el.getBoundingClientRect();
+                                return r.width > 2 && r.height > 2;
+                            };
+
+                            // Check if any loading spinner inside modal/results is still spinning
+                            const spinners = document.querySelectorAll(
+                                '.circliful-and-results .spinner, .circliful-and-results [us-spinner], ' +
+                                '.modal .spinner, .modal [us-spinner], us-spinner .spinner, [class*="loading-spinner"]'
+                            );
+                            for (const sp of spinners) {
+                                if (isVis(sp)) return false;
+                            }
+
+                            let hasScore = false;
+                            const numEl = document.querySelector('.circliful-container-results .timer .number');
+                            if (numEl && /\\d+/.test(numEl.textContent || '')) hasScore = true;
+                            const resTexts = document.querySelectorAll('.exercise-result-container .text');
+                            if (resTexts.length > 0 && /\\d+/.test(resTexts[0].textContent || '')) hasScore = true;
+
+                            let hasBtn = false;
+                            for (const sel of ['#nextButton', 'button.block-button.btn-primary.next', '.modal button.next']) {
+                                const b = document.querySelector(sel);
+                                if (b && !b.disabled && isVis(b)) {
+                                    hasBtn = true;
+                                    break;
+                                }
+                            }
+                            return Boolean(hasScore && hasBtn);
+                        }
+                        """
+                    )
+                )
+                if settled:
+                    time.sleep(0.18)
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.1)
+        return False
+
     def extract_completion_info(self):
+        self.wait_for_modal_settled(timeout=3.5)
         info = {"score": "N/A", "score_max": "N/A", "level": "N/A",
                 "progress": "N/A", "time": "N/A", "title": "N/A"}
         try:
@@ -399,6 +518,7 @@ class ModalAndPageMixin:
             return False
 
     def click_modal_continue(self):
+        self.wait_for_modal_settled(timeout=5.0)
         prev_url = ""
         try:
             prev_url = self.page.url or ""
@@ -632,7 +752,9 @@ class ModalAndPageMixin:
             for sel in [
                 ".folders-dropdown .title span",
                 "h1.exercise-header",
-                ".instructions-text",
+                ".subheader .title",
+                ".exercise-header .title",
+                ".packet-title",
             ]:
                 el = self.page.locator(sel).first
                 if el.count() > 0:

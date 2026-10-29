@@ -7,6 +7,15 @@ from ..ui_utils import Fore, Style
 
 
 class ResultsNavigationMixin:
+    def _is_on_results_page(self, url=None):
+        """Return True ONLY when the URL pathname itself is /results (ignoring ?goBackTo=.../results)."""
+        try:
+            raw = url if url is not None else (self.page.url if self.page else "")
+            clean = (raw or "").split("?")[0].split("#")[0].rstrip("/").lower()
+            return clean.endswith("/results") or "/results/" in clean
+        except Exception:
+            return False
+
     def _count_visible_exercise_rows(self):
         if not self.page:
             return 0
@@ -617,7 +626,7 @@ class ResultsNavigationMixin:
     def _ensure_results_chapter_and_exercises_ready(self, force_chapter_click=False, wait_timeout=15000):
         if not self.page:
             return False
-        if "/results" not in (self.page.url or "").lower():
+        if not self._is_on_results_page():
             if not self.navigate_to_results(interactive=False):
                 return False
             force_chapter_click = False
@@ -640,7 +649,7 @@ class ResultsNavigationMixin:
         if getattr(self, "force_solve_all", False):
             return False
         try:
-            if "/results" in (self.page.url or "").lower():
+            if self._is_on_results_page():
                 info_title = self.page.locator(".progress-info .info-title").first
                 if info_title.count() > 0:
                     text = info_title.inner_text().strip()
@@ -680,8 +689,8 @@ class ResultsNavigationMixin:
                 self._input(f"\n  {Fore.CYAN}[>] {self.T['press_enter']}{Style.RESET_ALL}")
             return False
 
-        # If ALREADY on /results, stay right here without bouncing to Dashboard!
-        if "/results" in (self.page.url or "").lower():
+        # If ALREADY on /results pathname, stay right here without bouncing to Dashboard!
+        if self._is_on_results_page():
             try:
                 self._discover_results_url()
                 self.page.locator(".level-container").first.wait_for(state="visible", timeout=8000)

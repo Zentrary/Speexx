@@ -174,24 +174,24 @@ class ExerciseRunnerMixin:
 
                 try:
                     self.page.wait_for_selector(
-                        ".exercise, .video, .exercises-large-navigation li",
+                        ".exercise, video, .exercises-large-navigation li",
                         state="visible",
                         timeout=15000
                     )
                 except Exception as e:
                     self.logger.warning(f"[WAIT] Exercise page not ready: {str(e)[:80]}")
-                    if "/results" in (self.page.url or "").lower():
+                    if self._is_on_results_page():
                         self.logger.info("[WAIT] Still on /results after row click; retrying inner cell click...")
                         if self._click_row_safely(title, row_index=row_index, click_inner_cell=True):
                             try:
                                 self.page.wait_for_selector(
-                                    ".exercise, .video, .exercises-large-navigation li",
+                                    ".exercise, video, .exercises-large-navigation li",
                                     state="visible",
                                     timeout=12000
                                 )
                             except Exception:
                                 pass
-                time.sleep(0.35)
+                self.wait_for_exercise_content_ready(timeout=6.0)
 
             self._ensure_chapter_db_loaded(announce=False)
 
@@ -215,7 +215,7 @@ class ExerciseRunnerMixin:
                 total_pages = self.get_total_exercises(retries=3, wait_seconds=0.6)
 
             if total_pages == 0:
-                if "/results" in (self.page.url or "").lower():
+                if self._is_on_results_page():
                     self.logger.warning("[TOTAL] Still on /results (total=0), re-selecting chapter & clicking row...")
                     if self._click_row_safely(title, row_index=row_index, click_inner_cell=True):
                         time.sleep(0.8)
@@ -310,8 +310,10 @@ class ExerciseRunnerMixin:
                         )
                         early_modal_completed = True
                         break
+                else:
+                    self.wait_for_exercise_content_ready(timeout=6.0)
 
-                et = engine.detect_type()
+                et = engine.detect_type(wait_timeout=6.0)
                 if et == "unknown" and self.detect_completion_modal() and not effective_force:
                     early_modal_completed = True
                     break
@@ -377,8 +379,9 @@ class ExerciseRunnerMixin:
                 )
 
                 if et == "type-video":
+                    vid_res = True
                     try:
-                        solver.solve()
+                        vid_res = solver.solve()
                     except Exception as e:
                         self.print_status("ERROR", f"Video solver error: {e}")
                         self.capture_web_error(
@@ -389,22 +392,43 @@ class ExerciseRunnerMixin:
                             solver_name="VideoSolver",
                             extra={"error": str(e)},
                         )
-                    self._record_page_to_db(
-                        title,
-                        i,
-                        total_pages,
-                        et,
-                        solver=solver,
-                        verified_override=True,
-                        persist=True,
-                    )
-                    pages_recorded_count += 1
-                    elapsed = solver.stop_timer() if solver.start_time else "N/A"
-                    self.print_status("RESULT", f"{self.T['page']} {i}: {self.T['success']} (video) | {elapsed}")
-                    results.append((i, "SUCCESS", 100, elapsed))
-                    if idx_pos == len(pages_to_solve) - 1:
-                        self._try_skip_to_next_page()
-                    continue
+                    if vid_res == "RE_DETECT":
+                        et = engine.detect_type(wait_timeout=4.5)
+                        self.print_status("PAGE", f"{self.T['page']} {i}/{total_pages} | {self.T['type']}: {et}")
+                        solver = engine.get_solver(
+                            et,
+                            force_solve=effective_force,
+                            exercise_title=title,
+                            page_number=i,
+                        )
+                        if not solver:
+                            results.append((i, "NO SOLVER", 0, "N/A"))
+                            all_success = False
+                            continue
+                        self._capture_answer_page_context(
+                            title, i, total_pages, et, solver
+                        )
+                        page_pass_line = (
+                            100 if et in {"type-drag-drop", "type-drag-drop-table"}
+                            else PASS_LINE
+                        )
+                    else:
+                        self._record_page_to_db(
+                            title,
+                            i,
+                            total_pages,
+                            et,
+                            solver=solver,
+                            verified_override=True,
+                            persist=True,
+                        )
+                        pages_recorded_count += 1
+                        elapsed = solver.stop_timer() if solver.start_time else "N/A"
+                        self.print_status("RESULT", f"{self.T['page']} {i}: {self.T['success']} (video) | {elapsed}")
+                        results.append((i, "SUCCESS", 100, elapsed))
+                        if idx_pos == len(pages_to_solve) - 1:
+                            self._try_skip_to_next_page()
+                        continue
 
                 if not effective_force:
                     try:
@@ -483,7 +507,7 @@ class ExerciseRunnerMixin:
                             modal_sc = 100
                         score = max(score, modal_sc, page_pass_line if success else 0)
                     else:
-                        score = solver.get_result_score(wait_for_score=False)
+                        score = solver.get_result_score(wait_for_score=True)
 
                     if score > best_score:
                         best_score = score
@@ -650,14 +674,16 @@ class ExerciseRunnerMixin:
                     self.print_status("OK", "Moving on (Continue)...")
                     try:
                         if auto_continue:
+                            # Wait up to 10s for Speexx to either load the next exercise packet OR redirect to /results
                             self.page.wait_for_function(
                                 """
                                 (previous) => {
                                     if (window.location.href !== previous.url) return true;
                                     const selectors = [
                                         '.folders-dropdown .title span',
-                                        '.instructions-text',
-                                        'h1.exercise-header'
+                                        'h1.exercise-header',
+                                        '.subheader .title',
+                                        '.packet-title'
                                     ];
                                     return selectors.some(selector => {
                                         const element = document.querySelector(selector);
@@ -667,10 +693,12 @@ class ExerciseRunnerMixin:
                                 }
                                 """,
                                 arg={"url": previous_url, "title": previous_title},
-                                timeout=12000,
+                                timeout=10000,
                             )
-                            if "/results" in (self.page.url or "").lower():
-                                self.logger.info("[VERIFY] [OK] เปลี่ยนกลับหน้า /results เพื่อเลือกแบบฝึกหัดถัดไป")
+                            if self._is_on_results_page():
+                                self.logger.info(
+                                    "[CONTINUE] Speexx redirected Continue learning back to /results (goBackTo) — opening next exercise in order"
+                                )
                                 return self._continue_auto_from_results(
                                     title, final_status, final_score,
                                     final_elapsed, chain_seen_titles,
@@ -679,26 +707,25 @@ class ExerciseRunnerMixin:
                                     chain_direction=chain_direction,
                                 )
 
-                        self.page.wait_for_selector(
-                            ".exercise, .video",
-                            state="visible",
-                            timeout=10000
-                        )
-
-                        # Wait for the new exercise's packet route & header title to finish settling
-                        settle_deadline = time.time() + 4.0
+                        # Wait for the new packet route & exercise content to finish settling
+                        settle_deadline = time.time() + 8.0
                         while time.time() < settle_deadline:
-                            if "/results" in (self.page.url or "").lower():
+                            if self._is_on_results_page():
                                 break
                             cand_pkt = self._extract_packet_key(self.page.url)
                             cand_title = self.get_current_exercise_title()
                             pkt_changed = bool(cand_pkt and cand_pkt != previous_pkt)
-                            title_ready = bool(cand_title and cand_title != "Unknown" and cand_title != previous_title)
-                            if pkt_changed and title_ready:
+                            title_changed = bool(
+                                cand_title and cand_title != "Unknown" and cand_title != previous_title
+                            )
+                            if pkt_changed or title_changed:
                                 break
                             time.sleep(0.15)
 
-                        if "/results" in (self.page.url or "").lower():
+                        if self._is_on_results_page():
+                            self.logger.info(
+                                "[CONTINUE] Speexx navigated to /results — opening next exercise in order"
+                            )
                             return self._continue_auto_from_results(
                                 title, final_status, final_score,
                                 final_elapsed, chain_seen_titles,
@@ -707,9 +734,11 @@ class ExerciseRunnerMixin:
                                 chain_direction=chain_direction,
                             )
 
+                        self.wait_for_exercise_content_ready(timeout=6.5)
+
                         new_total = self.get_total_exercises(
-                            retries=3,
-                            wait_seconds=0.5,
+                            retries=4,
+                            wait_seconds=0.6,
                         )
                         new_title = self.get_current_exercise_title()
                         new_pkt = self._extract_packet_key(self.page.url)
@@ -723,7 +752,7 @@ class ExerciseRunnerMixin:
                                 chain_direction=chain_direction,
                             )
                         if (auto_continue and new_pkt == previous_pkt and
-                                new_title == previous_title):
+                                (new_title == previous_title or new_title == "Unknown")):
                             self.logger.warning("[CONTINUE] Still on same exercise after Continue; falling back to /results")
                             return self._continue_auto_from_results(
                                 title, final_status, final_score,
@@ -760,6 +789,8 @@ class ExerciseRunnerMixin:
                                         chain_direction=chain_direction,
                                     )
                                 next_row_idx = expected_idx
+                                if (not new_title or new_title == "Unknown") and expected_title:
+                                    new_title = expected_title
 
                         if next_row_idx is None and known_titles and new_title and new_title != "Unknown":
                             nt_norm = self._norm_ex_title(new_title)
@@ -977,9 +1008,12 @@ class ExerciseRunnerMixin:
                 self.print_status("ERROR", self.T["open_next_failed"].format(next_title))
                 return (status, score, elapsed)
             self.page.wait_for_selector(
-                ".exercise, .video", state="visible", timeout=15000
+                ".exercise, video, .exercises-large-navigation li",
+                state="visible",
+                timeout=15000,
             )
-            next_total = self.get_total_exercises(retries=3, wait_seconds=0.5)
+            self.wait_for_exercise_content_ready(timeout=6.0)
+            next_total = self.get_total_exercises(retries=3, wait_seconds=0.6)
             if next_total == 0:
                 if self.page.locator(".exercise, .video").count() > 0:
                     next_total = 1

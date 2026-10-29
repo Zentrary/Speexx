@@ -33,9 +33,24 @@ class VideoSolver(BaseSolver):
             # Wait briefly for video metadata if duration not yet loaded
             self._wait_until_js(
                 "() => { const v = document.querySelector('video'); return Boolean(v && v.duration > 0); }",
-                timeout=2.0,
-                interval=0.06,
+                timeout=2.5,
+                interval=0.08,
             )
+
+            # Guard: if no <video> tag mounted and .exercise actually became a non-video exercise, signal re-detect
+            recheck_cls = self.page.evaluate(
+                """
+                () => {
+                    const videos = document.querySelectorAll('video');
+                    if (videos.length > 0) return '';
+                    const ex = document.querySelector('.exercise');
+                    return ex ? (ex.getAttribute('class') || '') : '';
+                }
+                """
+            ) or ""
+            if recheck_cls and "type-video" not in recheck_cls and "type-" in recheck_cls:
+                self.logger.warning(f"[VIDEO] Page transitioned to non-video class '{recheck_cls}' — requesting re-detect")
+                return "RE_DETECT"
 
             result = self.page.evaluate("""
                 () => {
